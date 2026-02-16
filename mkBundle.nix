@@ -3,6 +3,7 @@
 { drv
 , name ? drv.pname or drv.name or "bundle"
 , excludeLibs ? []
+, extraDirs ? []
 , useDefaultExcludes ? true
 , warnOnBinaryData ? false
 }:
@@ -105,6 +106,7 @@ pkgs.stdenv.mkDerivation {
   DRV_PATH = "${drv}";
   IS_DARWIN = if isDarwin then "1" else "0";
   EXCLUDE_LIBS = builtins.concatStringsSep "\n" allExcludeLibs;
+  EXTRA_DIRS = builtins.concatStringsSep "\n" extraDirs;
   WARN_ON_BINARY_DATA = if warnOnBinaryData then "1" else "0";
 
   buildPhase = ''

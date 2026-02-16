@@ -61,6 +61,58 @@ if [ -d "$DRV_PATH/lib" ]; then
   chmod -R u+w "$out/lib" 2>/dev/null || true
 fi
 
+# Replace Nix Qt wrappers with their unwrapped binaries.
+# wrapQtApps / makeBinaryWrapper generate compiled C wrappers that set
+# QT_PLUGIN_PATH etc. to /nix/store paths and then exec a wrapped binary.
+# Derivations may be double- (or multi-) wrapped, so we follow the chain by
+# extracting the exec target from the wrapper's embedded strings until we
+# reach a binary that is not itself a wrapper.
+# The bundle uses qt.conf for plugin discovery, making the wrappers unnecessary.
+if [ -d "$out/bin" ]; then
+  for f in "$out"/bin/*; do
+    [ -f "$f" ] || continue
+    strings "$f" 2>/dev/null | grep -q 'makeCWrapper' || continue
+
+    name="$(basename "$f")"
+    # Follow the wrapper chain: extract the exec target path from the wrapper
+    candidate="$f"
+    while strings "$candidate" 2>/dev/null | grep -q 'makeCWrapper'; do
+      # The wrapper embeds: makeCWrapper '/nix/store/.../bin/.name-wrapped' \
+      target="$(strings "$candidate" 2>/dev/null | sed -n "s/^makeCWrapper '\(.*\)' .*/\1/p" | head -1)"
+      if [ -z "$target" ] || [ ! -f "$target" ]; then
+        echo "  Warning: cannot follow wrapper chain for $name"
+        break
+      fi
+      candidate="$target"
+    done
+
+    if [ "$candidate" != "$f" ] && ! strings "$candidate" 2>/dev/null | grep -q 'makeCWrapper'; then
+      echo "  Replacing Nix wrapper with unwrapped binary: $name"
+      rm "$f"
+      cp -aL "$candidate" "$f"
+      chmod u+w "$f" 2>/dev/null || true
+    fi
+  done
+fi
+
+# Build extra dirs array
+extra_dirs=()
+if [ -n "${EXTRA_DIRS:-}" ]; then
+  while IFS= read -r dir; do
+    [ -n "$dir" ] && extra_dirs+=("$dir")
+  done <<< "$EXTRA_DIRS"
+fi
+
+# Copy extra directories from the derivation
+for dir in "${extra_dirs[@]+"${extra_dirs[@]}"}"; do
+  if [ -d "$DRV_PATH/$dir" ]; then
+    echo "  Copying extra directory: $dir"
+    mkdir -p "$out/$dir"
+    cp -aL "$DRV_PATH/$dir/." "$out/$dir/"
+    chmod -R u+w "$out/$dir" 2>/dev/null || true
+  fi
+done
+
 # ===========================================================================
 # Phase 2 — Trace and collect shared library dependencies
 # ===========================================================================
@@ -87,7 +139,37 @@ collect_lib() {
   real_path="$(realpath "$lib_path" 2>/dev/null)" || return 0
   [ -f "$real_path" ] || return 0
 
-  if [ ! -e "$out/lib/$lib_name" ]; then
+  # Detect framework structure from source path (e.g. .../Foo.framework/Versions/A/Foo)
+  local is_framework=0
+  local fw_relpath=""
+  if [[ "$lib_path" == *.framework/* ]]; then
+    is_framework=1
+    # Extract from the .framework component onward (e.g. QtCore.framework/Versions/A/QtCore)
+    fw_relpath="${lib_path##*/lib/}"
+    # Fallback: extract starting from *.framework/
+    if [[ "$fw_relpath" != *.framework/* ]]; then
+      fw_relpath="${lib_path#*\.framework/}"
+      local fw_name_part="${lib_path%%\.framework/*}"
+      fw_name_part="${fw_name_part##*/}"
+      fw_relpath="${fw_name_part}.framework/${fw_relpath}"
+    fi
+    framework_map[$lib_name]="$fw_relpath"
+    framework_count=$((framework_count + 1))
+  fi
+
+  # If the framework directory already exists (e.g. copied in Phase 1), skip the flat copy
+  if [ "$is_framework" = "1" ]; then
+    local fw_top="${fw_relpath%%/*}"
+    if [ -d "$out/lib/$fw_top" ]; then
+      # Framework already present — don't create a flat duplicate
+      echo "  $lib_name (framework already bundled)"
+    elif [ ! -e "$out/lib/$lib_name" ]; then
+      mkdir -p "$out/lib"
+      cp -a "$lib_path" "$out/lib/"
+      chmod u+w "$out/lib/$lib_name" 2>/dev/null || true
+      echo "  $lib_name"
+    fi
+  elif [ ! -e "$out/lib/$lib_name" ]; then
     mkdir -p "$out/lib"
     cp -a "$lib_path" "$out/lib/"
     if [ -L "$lib_path" ]; then
@@ -99,22 +181,6 @@ collect_lib() {
     fi
     chmod u+w "$out/lib/$lib_name" 2>/dev/null || true
     echo "  $lib_name"
-
-    # Detect framework structure from source path (e.g. .../Foo.framework/Versions/A/Foo)
-    if [[ "$lib_path" == *.framework/* ]]; then
-      local fw_relpath
-      # Extract from the .framework component onward (e.g. QtCore.framework/Versions/A/QtCore)
-      fw_relpath="${lib_path##*/lib/}"
-      # Fallback: extract starting from *.framework/
-      if [[ "$fw_relpath" != *.framework/* ]]; then
-        fw_relpath="${lib_path#*\.framework/}"
-        local fw_name_part="${lib_path%%\.framework/*}"
-        fw_name_part="${fw_name_part##*/}"
-        fw_relpath="${fw_name_part}.framework/${fw_relpath}"
-      fi
-      framework_map[$lib_name]="$fw_relpath"
-      framework_count=$((framework_count + 1))
-    fi
   fi
 
   trace_deps "$real_path"
@@ -202,6 +268,15 @@ if [ -d "$out/lib" ]; then
   done
 fi
 
+# Trace deps of shared libraries in extra directories
+for dir in "${extra_dirs[@]+"${extra_dirs[@]}"}"; do
+  if [ -d "$out/$dir" ]; then
+    while IFS= read -r f; do
+      trace_deps "$f"
+    done < <(find "$out/$dir" -type f \( -name '*.dylib' -o -name '*.so' \))
+  fi
+done
+
 # Fix absolute symlinks in lib/ that point into /nix/store
 if [ -d "$out/lib" ]; then
   find "$out/lib" -type l | while IFS= read -r link; do
@@ -216,28 +291,6 @@ if [ -d "$out/lib" ]; then
         cp -aL "$target" "$link"
         chmod u+w "$link" 2>/dev/null || true
       fi
-    fi
-  done
-fi
-
-# Restructure framework libraries into proper .framework directory layout
-if [ "$IS_DARWIN" = "1" ] && [ "$framework_count" -gt 0 ]; then
-  echo "  Restructuring frameworks..."
-  for fw_basename in "${!framework_map[@]}"; do
-    fw_relpath="${framework_map[$fw_basename]}"
-    # Only restructure if the file exists as a flat file in lib/
-    if [ -f "$out/lib/$fw_basename" ] && [ ! -d "$out/lib/${fw_relpath%%/*}" ]; then
-      echo "  Restructuring framework: $fw_basename -> $fw_relpath"
-      fw_dir="$(dirname "$fw_relpath")"
-      mkdir -p "$out/lib/$fw_dir"
-      mv "$out/lib/$fw_basename" "$out/lib/$fw_relpath"
-      # Create standard framework symlinks (Versions/Current -> <version>)
-      fw_top="${fw_relpath%%/*}"
-      versions_dir="${fw_relpath#*/}"  # e.g. Versions/A/QtCore
-      version_name="${versions_dir#Versions/}"
-      version_name="${version_name%%/*}"  # e.g. A
-      ln -sf "$version_name" "$out/lib/$fw_top/Versions/Current"
-      ln -sf "Versions/Current/$fw_basename" "$out/lib/$fw_top/$fw_basename"
     fi
   done
 fi
@@ -292,19 +345,88 @@ if [ "$qt_detected" = "1" ]; then
     while IFS= read -r plugin; do
       trace_deps "$plugin"
     done < <(find "$out/lib/qt/plugins" -type f \( -name '*.dylib' -o -name '*.so' \))
-
-    # Create qt.conf so Qt can find plugins relative to the binary
-    if [ -d "$out/bin" ]; then
-      echo "  Creating qt.conf..."
-      cat > "$out/bin/qt.conf" <<'QTCONF'
-[Paths]
-Prefix = ..
-Plugins = lib/qt/plugins
-QTCONF
-    fi
   else
     echo "  Warning: Qt detected but no plugins directory found in closure"
   fi
+
+  # Bundle QML modules (QtQuick.Controls, QtRemoteObjects, etc.)
+  echo "  Bundling QML modules..."
+  qt_qml_found=0
+  while IFS= read -r storePath; do
+    for candidate in "$storePath/lib/qt-6/qml" "$storePath/lib/qt-5/qml" "$storePath/share/qt-6/qml" "$storePath/share/qt-5/qml" "$storePath/lib/qt6/qml" "$storePath/lib/qt5/qml"; do
+      if [ -d "$candidate" ]; then
+        echo "  Found QML modules: $candidate"
+        mkdir -p "$out/lib/qt/qml"
+        # Merge contents (multiple store paths may contribute different modules)
+        cp -aLn "$candidate"/. "$out/lib/qt/qml/" 2>/dev/null || true
+        chmod -R u+w "$out/lib/qt/qml" 2>/dev/null || true
+        qt_qml_found=1
+      fi
+    done
+  done < "$CLOSURE_PATHS"
+
+  if [ "$qt_qml_found" = "1" ]; then
+    # Trace deps of shared libraries inside QML modules
+    echo "  Tracing QML module dependencies..."
+    while IFS= read -r qml_lib; do
+      trace_deps "$qml_lib"
+    done < <(find "$out/lib/qt/qml" -type f \( -name '*.dylib' -o -name '*.so' \))
+  fi
+
+  # Symlink app-shipped QML modules (in lib/ outside lib/qt/) into the
+  # QML import path so they are discoverable alongside Qt's own modules.
+  # QML modules are identified by the presence of a qmldir file.
+  if [ -d "$out/lib/qt/qml" ] && [ -d "$out/lib" ]; then
+    while IFS= read -r qmldir; do
+      mod_dir="$(dirname "$qmldir")"
+      # Relative path from $out/lib, e.g. "Logos/Theme"
+      rel="${mod_dir#$out/lib/}"
+      # Skip anything already under qt/
+      [[ "$rel" == qt/* ]] && continue
+      if [ ! -e "$out/lib/qt/qml/$rel" ]; then
+        echo "  Symlinking app QML module: $rel"
+        link_parent="$(dirname "$out/lib/qt/qml/$rel")"
+        mkdir -p "$link_parent"
+        target="$(realpath --relative-to="$link_parent" "$mod_dir")"
+        ln -sf "$target" "$out/lib/qt/qml/$rel"
+      fi
+    done < <(find "$out/lib" -name 'qmldir' -not -path '*/qt/*')
+  fi
+
+  # Create qt.conf so Qt can find plugins and QML modules relative to the binary
+  if [ -d "$out/bin" ]; then
+    echo "  Creating qt.conf..."
+    cat > "$out/bin/qt.conf" <<'QTCONF'
+[Paths]
+Prefix = ..
+Plugins = lib/qt/plugins
+QmlImports = lib/qt/qml
+QTCONF
+  fi
+fi
+
+# Restructure framework libraries into proper .framework directory layout.
+# This must run after all dependency tracing (Phase 2, 2b, extra dirs) so that
+# every framework collected as a flat file gets restructured.
+if [ "$IS_DARWIN" = "1" ] && [ "$framework_count" -gt 0 ]; then
+  echo "  Restructuring frameworks..."
+  for fw_basename in "${!framework_map[@]}"; do
+    fw_relpath="${framework_map[$fw_basename]}"
+    # Only restructure if the file exists as a flat file in lib/
+    if [ -f "$out/lib/$fw_basename" ] && [ ! -d "$out/lib/${fw_relpath%%/*}" ]; then
+      echo "  Restructuring framework: $fw_basename -> $fw_relpath"
+      fw_dir="$(dirname "$fw_relpath")"
+      mkdir -p "$out/lib/$fw_dir"
+      mv "$out/lib/$fw_basename" "$out/lib/$fw_relpath"
+      # Create standard framework symlinks (Versions/Current -> <version>)
+      fw_top="${fw_relpath%%/*}"
+      versions_dir="${fw_relpath#*/}"  # e.g. Versions/A/QtCore
+      version_name="${versions_dir#Versions/}"
+      version_name="${version_name%%/*}"  # e.g. A
+      ln -sf "$version_name" "$out/lib/$fw_top/Versions/Current"
+      ln -sf "Versions/Current/$fw_basename" "$out/lib/$fw_top/$fw_basename"
+    fi
+  done
 fi
 
 # ===========================================================================
@@ -343,13 +465,13 @@ if [ "$IS_DARWIN" = "1" ]; then
       dep="$(echo "$line" | sed -E 's/^[[:space:]]*([^[:space:]]+).*/\1/')"
       if [[ "$dep" == /nix/store/* ]]; then
         lib_name="$(basename "$dep")"
-        if [ -f "$out/lib/$lib_name" ] || [ -L "$out/lib/$lib_name" ]; then
-          install_name_tool -change "$dep" "$lib_prefix/$lib_name" "$f" 2>/dev/null || \
-            echo "  Warning: install_name_tool -change failed for $dep in $f"
-        elif [[ -n "${framework_map[$lib_name]:-}" ]]; then
+        if [[ -n "${framework_map[$lib_name]:-}" ]]; then
           # Framework lib — rewrite to @rpath/ so rpath resolves it
           local fw_rpath="@rpath/${framework_map[$lib_name]}"
           install_name_tool -change "$dep" "$fw_rpath" "$f" 2>/dev/null || \
+            echo "  Warning: install_name_tool -change failed for $dep in $f"
+        elif [ -f "$out/lib/$lib_name" ] || [ -L "$out/lib/$lib_name" ]; then
+          install_name_tool -change "$dep" "$lib_prefix/$lib_name" "$f" 2>/dev/null || \
             echo "  Warning: install_name_tool -change failed for $dep in $f"
         elif is_excluded "$lib_name"; then
           # Excluded system library — rewrite to /usr/lib/ (strip minor version)
@@ -525,6 +647,9 @@ echo "Phase 6: Verifying portability..."
 test_dir="$(mktemp -d)"
 [ -d "$out/bin" ] && cp -a "$out/bin" "$test_dir/bin"
 [ -d "$out/lib" ] && cp -a "$out/lib" "$test_dir/lib"
+for dir in "${extra_dirs[@]+"${extra_dirs[@]}"}"; do
+  [ -d "$out/$dir" ] && cp -a "$out/$dir" "$test_dir/$dir"
+done
 
 errors=0
 
