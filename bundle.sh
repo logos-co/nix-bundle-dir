@@ -243,6 +243,71 @@ if [ "$IS_DARWIN" = "1" ] && [ "$framework_count" -gt 0 ]; then
 fi
 
 # ===========================================================================
+# Phase 2b — Bundle Qt plugins (if Qt is present)
+# ===========================================================================
+# Qt plugins are loaded at runtime via dlopen and won't appear in the
+# dependency trace. If we bundled any Qt library, search the closure for
+# the plugins directory, copy it, trace plugin deps, and create qt.conf.
+qt_detected=0
+if [ "$framework_count" -gt 0 ]; then
+  for fw in "${!framework_map[@]}"; do
+    if [[ "$fw" == Qt* ]]; then
+      qt_detected=1
+      break
+    fi
+  done
+fi
+# Also check for flat Qt libs (non-framework, e.g. Linux)
+if [ "$qt_detected" = "0" ] && [ -d "$out/lib" ]; then
+  for f in "$out"/lib/libQt*.so* "$out"/lib/libQt*.dylib; do
+    if [ -e "$f" ]; then
+      qt_detected=1
+      break
+    fi
+  done
+fi
+
+if [ "$qt_detected" = "1" ]; then
+  echo "Phase 2b: Bundling Qt plugins..."
+  qt_plugins_found=0
+
+  while IFS= read -r storePath; do
+    # Look for Qt plugin directories (qt-5/plugins, qt-6/plugins, or just plugins/platforms)
+    for candidate in "$storePath/lib/qt-6/plugins" "$storePath/lib/qt-5/plugins" "$storePath/share/qt-6/plugins" "$storePath/share/qt-5/plugins" "$storePath/lib/qt6/plugins" "$storePath/lib/qt5/plugins"; do
+      if [ -d "$candidate/platforms" ]; then
+        echo "  Found Qt plugins: $candidate"
+        mkdir -p "$out/lib/qt/plugins"
+        cp -aL "$candidate"/* "$out/lib/qt/plugins/"
+        chmod -R u+w "$out/lib/qt/plugins" 2>/dev/null || true
+        qt_plugins_found=1
+        break
+      fi
+    done
+    [ "$qt_plugins_found" = "1" ] && break
+  done < "$CLOSURE_PATHS"
+
+  if [ "$qt_plugins_found" = "1" ]; then
+    # Trace deps of all plugin shared libraries
+    echo "  Tracing plugin dependencies..."
+    while IFS= read -r plugin; do
+      trace_deps "$plugin"
+    done < <(find "$out/lib/qt/plugins" -type f \( -name '*.dylib' -o -name '*.so' \))
+
+    # Create qt.conf so Qt can find plugins relative to the binary
+    if [ -d "$out/bin" ]; then
+      echo "  Creating qt.conf..."
+      cat > "$out/bin/qt.conf" <<'QTCONF'
+[Paths]
+Prefix = ..
+Plugins = lib/qt/plugins
+QTCONF
+    fi
+  else
+    echo "  Warning: Qt detected but no plugins directory found in closure"
+  fi
+fi
+
+# ===========================================================================
 # Phase 3 — Rewrite dynamic linking references (all Mach-O/ELF under $out)
 # ===========================================================================
 echo "Phase 3: Rewriting dynamic linking references..."
