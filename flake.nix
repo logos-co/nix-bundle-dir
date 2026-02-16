@@ -25,6 +25,7 @@
             mkBundle {
               inherit drv warnOnBinaryData;
               name = drv.pname or drv.name or "bundle";
+              extraDirs = drv.extraDirs or [];
             };
         in {
           default = bundle { warnOnBinaryData = false; };
