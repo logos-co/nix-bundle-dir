@@ -23,6 +23,22 @@ is_excluded() {
   return 1
 }
 
+is_portable_ref() {
+  local ref="$1"
+  case "$ref" in
+    @executable_path/*|@loader_path/*|@rpath/*) return 0 ;;
+    /System/Library/*|/usr/lib/*) return 0 ;;
+    /lib/*|/lib64/*|/usr/lib64/*) return 0 ;;
+    '') return 0 ;;
+  esac
+  # Bare library names (no path separator) are portable
+  case "$ref" in
+    */*) ;;
+    *) return 0 ;;
+  esac
+  return 1
+}
+
 # ===========================================================================
 # Phase 1 — Copy executables and libraries from the main derivation
 # ===========================================================================
@@ -51,6 +67,8 @@ fi
 echo "Phase 2: Tracing shared library dependencies..."
 
 declare -A visited
+declare -A framework_map
+framework_count=0
 
 collect_lib() {
   local lib_path="$1"
@@ -81,6 +99,22 @@ collect_lib() {
     fi
     chmod u+w "$out/lib/$lib_name" 2>/dev/null || true
     echo "  $lib_name"
+
+    # Detect framework structure from source path (e.g. .../Foo.framework/Versions/A/Foo)
+    if [[ "$lib_path" == *.framework/* ]]; then
+      local fw_relpath
+      # Extract from the .framework component onward (e.g. QtCore.framework/Versions/A/QtCore)
+      fw_relpath="${lib_path##*/lib/}"
+      # Fallback: extract starting from *.framework/
+      if [[ "$fw_relpath" != *.framework/* ]]; then
+        fw_relpath="${lib_path#*\.framework/}"
+        local fw_name_part="${lib_path%%\.framework/*}"
+        fw_name_part="${fw_name_part##*/}"
+        fw_relpath="${fw_name_part}.framework/${fw_relpath}"
+      fi
+      framework_map[$lib_name]="$fw_relpath"
+      framework_count=$((framework_count + 1))
+    fi
   fi
 
   trace_deps "$real_path"
@@ -98,7 +132,9 @@ trace_deps() {
       rpath_dirs_macho+=("$rpath")
     done < <(otool -l "$bin" 2>/dev/null | awk '/cmd LC_RPATH/{found=1} found && /path /{print $2; found=0}')
 
-    otool -L "$bin" 2>/dev/null | tail -n +2 | while IFS= read -r line; do
+    while IFS= read -r line; do
+      # Skip fat binary architecture headers
+      [[ "$line" == *"(architecture"* ]] && continue
       dep="$(echo "$line" | sed -E 's/^[[:space:]]*([^[:space:]]+).*/\1/')"
       if [[ "$dep" == /nix/store/* ]] && [ -f "$dep" ]; then
         collect_lib "$dep"
@@ -112,7 +148,7 @@ trace_deps() {
           fi
         done
       fi
-    done
+    done < <(otool -L "$bin" 2>/dev/null | tail -n +2)
   elif [[ "$filetype" == *ELF* ]]; then
     local rpath_val
     rpath_val="$(patchelf --print-rpath "$bin" 2>/dev/null)" || true
@@ -184,6 +220,28 @@ if [ -d "$out/lib" ]; then
   done
 fi
 
+# Restructure framework libraries into proper .framework directory layout
+if [ "$IS_DARWIN" = "1" ] && [ "$framework_count" -gt 0 ]; then
+  echo "  Restructuring frameworks..."
+  for fw_basename in "${!framework_map[@]}"; do
+    fw_relpath="${framework_map[$fw_basename]}"
+    # Only restructure if the file exists as a flat file in lib/
+    if [ -f "$out/lib/$fw_basename" ] && [ ! -d "$out/lib/${fw_relpath%%/*}" ]; then
+      echo "  Restructuring framework: $fw_basename -> $fw_relpath"
+      fw_dir="$(dirname "$fw_relpath")"
+      mkdir -p "$out/lib/$fw_dir"
+      mv "$out/lib/$fw_basename" "$out/lib/$fw_relpath"
+      # Create standard framework symlinks (Versions/Current -> <version>)
+      fw_top="${fw_relpath%%/*}"
+      versions_dir="${fw_relpath#*/}"  # e.g. Versions/A/QtCore
+      version_name="${versions_dir#Versions/}"
+      version_name="${version_name%%/*}"  # e.g. A
+      ln -sf "$version_name" "$out/lib/$fw_top/Versions/Current"
+      ln -sf "Versions/Current/$fw_basename" "$out/lib/$fw_top/$fw_basename"
+    fi
+  done
+fi
+
 # ===========================================================================
 # Phase 3 — Rewrite dynamic linking references (all Mach-O/ELF under $out)
 # ===========================================================================
@@ -215,34 +273,98 @@ if [ "$IS_DARWIN" = "1" ]; then
     local lib_prefix="@loader_path/$rel_to_lib"
 
     otool -L "$f" 2>/dev/null | tail -n +2 | while IFS= read -r line; do
+      # Skip fat binary architecture headers (e.g. "/path/to/lib (architecture arm64):")
+      [[ "$line" == *"(architecture"* ]] && continue
       dep="$(echo "$line" | sed -E 's/^[[:space:]]*([^[:space:]]+).*/\1/')"
-      [[ "$dep" == /nix/store/* ]] || continue
-      lib_name="$(basename "$dep")"
-      if [ -f "$out/lib/$lib_name" ] || [ -L "$out/lib/$lib_name" ]; then
-        install_name_tool -change "$dep" "$lib_prefix/$lib_name" "$f" 2>/dev/null || \
-          echo "  Warning: install_name_tool -change failed for $dep in $f"
-      elif is_excluded "$lib_name"; then
-        # Excluded system library — rewrite to /usr/lib/ (strip minor version)
-        local sys_path
-        sys_path="$(macos_system_lib_path "$lib_name")"
-        install_name_tool -change "$dep" "$sys_path" "$f" 2>/dev/null || \
-          echo "  Warning: install_name_tool -change failed for $dep in $f"
+      if [[ "$dep" == /nix/store/* ]]; then
+        lib_name="$(basename "$dep")"
+        if [ -f "$out/lib/$lib_name" ] || [ -L "$out/lib/$lib_name" ]; then
+          install_name_tool -change "$dep" "$lib_prefix/$lib_name" "$f" 2>/dev/null || \
+            echo "  Warning: install_name_tool -change failed for $dep in $f"
+        elif [[ -n "${framework_map[$lib_name]:-}" ]]; then
+          # Framework lib — rewrite to @rpath/ so rpath resolves it
+          local fw_rpath="@rpath/${framework_map[$lib_name]}"
+          install_name_tool -change "$dep" "$fw_rpath" "$f" 2>/dev/null || \
+            echo "  Warning: install_name_tool -change failed for $dep in $f"
+        elif is_excluded "$lib_name"; then
+          # Excluded system library — rewrite to /usr/lib/ (strip minor version)
+          local sys_path
+          sys_path="$(macos_system_lib_path "$lib_name")"
+          install_name_tool -change "$dep" "$sys_path" "$f" 2>/dev/null || \
+            echo "  Warning: install_name_tool -change failed for $dep in $f"
+        fi
+      elif [[ "$dep" == @rpath/* ]]; then
+        local rpath_suffix="${dep#@rpath/}"
+        if [[ "$rpath_suffix" == *.framework/* ]]; then
+          # Framework reference — keep @rpath/ intact if framework dir exists
+          local fw_top="${rpath_suffix%%/*}"
+          if [ -d "$out/lib/$fw_top" ]; then
+            : # skip — rpath will resolve this
+          else
+            # Framework not restructured, rewrite to flat path
+            lib_name="$(basename "$dep")"
+            if [ -f "$out/lib/$lib_name" ] || [ -L "$out/lib/$lib_name" ]; then
+              install_name_tool -change "$dep" "$lib_prefix/$lib_name" "$f" 2>/dev/null || \
+                echo "  Warning: install_name_tool -change failed for $dep in $f"
+            fi
+          fi
+        else
+          # Non-framework @rpath/ reference — rewrite to flat lib/ if we have the lib
+          lib_name="$(basename "$dep")"
+          if [ -f "$out/lib/$lib_name" ] || [ -L "$out/lib/$lib_name" ]; then
+            install_name_tool -change "$dep" "$lib_prefix/$lib_name" "$f" 2>/dev/null || \
+              echo "  Warning: install_name_tool -change failed for $dep in $f"
+          fi
+        fi
+      elif ! is_portable_ref "$dep"; then
+        # Non-portable absolute path (e.g. build dir leak) — rewrite if we have the lib
+        lib_name="$(basename "$dep")"
+        if [ -f "$out/lib/$lib_name" ] || [ -L "$out/lib/$lib_name" ]; then
+          install_name_tool -change "$dep" "$lib_prefix/$lib_name" "$f" 2>/dev/null || \
+            echo "  Warning: install_name_tool -change failed for $dep in $f"
+        fi
       fi
     done
 
+    # Fix install name
     local current_id
     current_id="$(otool -D "$f" 2>/dev/null | tail -n +2 | head -1 | xargs)" || true
-    if [[ -n "$current_id" && "$current_id" == /nix/store/* ]]; then
+    if [[ -z "$current_id" ]]; then
+      # otool -D returned nothing (e.g. MH_BUNDLE); check first otool -L entry
+      current_id="$(otool -L "$f" 2>/dev/null | sed -n '2p' | sed -E 's/^[[:space:]]*([^[:space:]]+).*/\1/')" || true
+    fi
+    if [[ -n "$current_id" ]]; then
       local id_name
       id_name="$(basename "$current_id")"
-      if is_excluded "$id_name"; then
-        local sys_id_path
-        sys_id_path="$(macos_system_lib_path "$id_name")"
-        install_name_tool -id "$sys_id_path" "$f" 2>/dev/null || \
-          echo "  Warning: install_name_tool -id failed for $f"
-      else
-        install_name_tool -id "$lib_prefix/$id_name" "$f" 2>/dev/null || \
-          echo "  Warning: install_name_tool -id failed for $f"
+      local needs_rewrite=0
+      if ! is_portable_ref "$current_id"; then
+        needs_rewrite=1
+      elif [[ "$current_id" == @rpath/* ]]; then
+        local id_rpath_suffix="${current_id#@rpath/}"
+        if [[ "$id_rpath_suffix" == *.framework/* ]]; then
+          # Framework install name — keep if framework dir exists
+          local id_fw_top="${id_rpath_suffix%%/*}"
+          if [ ! -d "$out/lib/$id_fw_top" ]; then
+            needs_rewrite=1
+          fi
+        elif [ -f "$out/lib/$id_name" ] || [ -L "$out/lib/$id_name" ]; then
+          needs_rewrite=1
+        fi
+      fi
+      if [ "$needs_rewrite" = "1" ]; then
+        if is_excluded "$id_name"; then
+          local sys_id_path
+          sys_id_path="$(macos_system_lib_path "$id_name")"
+          install_name_tool -id "$sys_id_path" "$f" 2>/dev/null || \
+            echo "  Warning: install_name_tool -id failed for $f"
+        elif [[ -n "${framework_map[$id_name]:-}" ]]; then
+          # Framework lib — set install name to @rpath/Foo.framework/Versions/A/Foo
+          install_name_tool -id "@rpath/${framework_map[$id_name]}" "$f" 2>/dev/null || \
+            echo "  Warning: install_name_tool -id failed for $f"
+        else
+          install_name_tool -id "$lib_prefix/$id_name" "$f" 2>/dev/null || \
+            echo "  Warning: install_name_tool -id failed for $f"
+        fi
       fi
     fi
 
@@ -341,28 +463,14 @@ test_dir="$(mktemp -d)"
 
 errors=0
 
-is_portable_ref() {
-  local ref="$1"
-  case "$ref" in
-    @executable_path/*|@loader_path/*|@rpath/*) return 0 ;;
-    /System/Library/*|/usr/lib/*) return 0 ;;
-    /lib/*|/lib64/*|/usr/lib64/*) return 0 ;;
-    '') return 0 ;;
-  esac
-  # Bare library names (no path separator) are portable
-  case "$ref" in
-    */*) ;;
-    *) return 0 ;;
-  esac
-  return 1
-}
-
 check_macho() {
   local f="$1"
   local rel="${f#$test_dir/}"
 
   # Check load commands (otool -L)
   otool -L "$f" 2>/dev/null | tail -n +2 | while IFS= read -r line; do
+    # Skip fat binary architecture headers (e.g. "/path/to/lib (architecture arm64):")
+    [[ "$line" == *"(architecture"* ]] && continue
     dep="$(echo "$line" | sed -E 's/^[[:space:]]*([^[:space:]]+).*/\1/')"
     if ! is_portable_ref "$dep"; then
       echo "  ERROR: $rel has non-portable load command: $dep"
