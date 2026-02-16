@@ -68,6 +68,7 @@ echo "Phase 2: Tracing shared library dependencies..."
 
 declare -A visited
 declare -A framework_map
+framework_count=0
 
 collect_lib() {
   local lib_path="$1"
@@ -98,6 +99,22 @@ collect_lib() {
     fi
     chmod u+w "$out/lib/$lib_name" 2>/dev/null || true
     echo "  $lib_name"
+
+    # Detect framework structure from source path (e.g. .../Foo.framework/Versions/A/Foo)
+    if [[ "$lib_path" == *.framework/* ]]; then
+      local fw_relpath
+      # Extract from the .framework component onward (e.g. QtCore.framework/Versions/A/QtCore)
+      fw_relpath="${lib_path##*/lib/}"
+      # Fallback: extract starting from *.framework/
+      if [[ "$fw_relpath" != *.framework/* ]]; then
+        fw_relpath="${lib_path#*\.framework/}"
+        local fw_name_part="${lib_path%%\.framework/*}"
+        fw_name_part="${fw_name_part##*/}"
+        fw_relpath="${fw_name_part}.framework/${fw_relpath}"
+      fi
+      framework_map[$lib_name]="$fw_relpath"
+      framework_count=$((framework_count + 1))
+    fi
   fi
 
   trace_deps "$real_path"
@@ -126,12 +143,6 @@ trace_deps() {
         local rpath_lib="${dep#@rpath/}"
         for rdir in "${rpath_dirs_macho[@]}"; do
           if [ -f "$rdir/$rpath_lib" ]; then
-            # Record framework mapping if this is a framework-style path
-            if [[ "$rpath_lib" == *.framework/* ]]; then
-              local fw_basename
-              fw_basename="$(basename "$rpath_lib")"
-              framework_map[$fw_basename]="$rpath_lib"
-            fi
             collect_lib "$rdir/$rpath_lib"
             break
           fi
@@ -210,12 +221,13 @@ if [ -d "$out/lib" ]; then
 fi
 
 # Restructure framework libraries into proper .framework directory layout
-if [ "$IS_DARWIN" = "1" ] && [ "${#framework_map[@]}" -gt 0 ]; then
+if [ "$IS_DARWIN" = "1" ] && [ "$framework_count" -gt 0 ]; then
   echo "  Restructuring frameworks..."
   for fw_basename in "${!framework_map[@]}"; do
     fw_relpath="${framework_map[$fw_basename]}"
     # Only restructure if the file exists as a flat file in lib/
     if [ -f "$out/lib/$fw_basename" ] && [ ! -d "$out/lib/${fw_relpath%%/*}" ]; then
+      echo "  Restructuring framework: $fw_basename -> $fw_relpath"
       fw_dir="$(dirname "$fw_relpath")"
       mkdir -p "$out/lib/$fw_dir"
       mv "$out/lib/$fw_basename" "$out/lib/$fw_relpath"
@@ -226,7 +238,6 @@ if [ "$IS_DARWIN" = "1" ] && [ "${#framework_map[@]}" -gt 0 ]; then
       version_name="${version_name%%/*}"  # e.g. A
       ln -sf "$version_name" "$out/lib/$fw_top/Versions/Current"
       ln -sf "Versions/Current/$fw_basename" "$out/lib/$fw_top/$fw_basename"
-      echo "    $fw_basename -> $fw_relpath"
     fi
   done
 fi
@@ -269,6 +280,11 @@ if [ "$IS_DARWIN" = "1" ]; then
         lib_name="$(basename "$dep")"
         if [ -f "$out/lib/$lib_name" ] || [ -L "$out/lib/$lib_name" ]; then
           install_name_tool -change "$dep" "$lib_prefix/$lib_name" "$f" 2>/dev/null || \
+            echo "  Warning: install_name_tool -change failed for $dep in $f"
+        elif [[ -n "${framework_map[$lib_name]:-}" ]]; then
+          # Framework lib — rewrite to @rpath/ so rpath resolves it
+          local fw_rpath="@rpath/${framework_map[$lib_name]}"
+          install_name_tool -change "$dep" "$fw_rpath" "$f" 2>/dev/null || \
             echo "  Warning: install_name_tool -change failed for $dep in $f"
         elif is_excluded "$lib_name"; then
           # Excluded system library — rewrite to /usr/lib/ (strip minor version)
@@ -340,6 +356,10 @@ if [ "$IS_DARWIN" = "1" ]; then
           local sys_id_path
           sys_id_path="$(macos_system_lib_path "$id_name")"
           install_name_tool -id "$sys_id_path" "$f" 2>/dev/null || \
+            echo "  Warning: install_name_tool -id failed for $f"
+        elif [[ -n "${framework_map[$id_name]:-}" ]]; then
+          # Framework lib — set install name to @rpath/Foo.framework/Versions/A/Foo
+          install_name_tool -id "@rpath/${framework_map[$id_name]}" "$f" 2>/dev/null || \
             echo "  Warning: install_name_tool -id failed for $f"
         else
           install_name_tool -id "$lib_prefix/$id_name" "$f" 2>/dev/null || \
