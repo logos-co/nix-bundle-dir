@@ -349,58 +349,112 @@ if [ "$qt_detected" = "1" ]; then
     echo "  Warning: Qt detected but no plugins directory found in closure"
   fi
 
-  # Bundle QML modules (QtQuick.Controls, QtRemoteObjects, etc.)
-  echo "  Bundling QML modules..."
-  qt_qml_found=0
-  while IFS= read -r storePath; do
-    for candidate in "$storePath/lib/qt-6/qml" "$storePath/lib/qt-5/qml" "$storePath/share/qt-6/qml" "$storePath/share/qt-5/qml" "$storePath/lib/qt6/qml" "$storePath/lib/qt5/qml"; do
-      if [ -d "$candidate" ]; then
-        echo "  Found QML modules: $candidate"
-        mkdir -p "$out/lib/qt/qml"
-        # Merge contents (multiple store paths may contribute different modules)
-        cp -aLn "$candidate"/. "$out/lib/qt/qml/" 2>/dev/null || true
-        chmod -R u+w "$out/lib/qt/qml" 2>/dev/null || true
-        qt_qml_found=1
+  # Bundle QML modules only when the derivation actually uses QtQml/QtQuick.
+  # Non-UI derivations (e.g. using only QtCore/QtNetwork) don't need QML.
+  qml_needed=0
+  if [ "$IS_DARWIN" = "1" ]; then
+    for fw in "${!framework_map[@]}"; do
+      if [[ "$fw" == QtQml* ]] || [[ "$fw" == QtQuick* ]]; then
+        qml_needed=1
+        break
       fi
     done
-  done < "$CLOSURE_PATHS"
-
-  if [ "$qt_qml_found" = "1" ]; then
-    # Trace deps of shared libraries inside QML modules
-    echo "  Tracing QML module dependencies..."
-    while IFS= read -r qml_lib; do
-      trace_deps "$qml_lib"
-    done < <(find "$out/lib/qt/qml" -type f \( -name '*.dylib' -o -name '*.so' \))
+  else
+    for f in "$out"/lib/libQt*Qml*.so* "$out"/lib/libQt*Quick*.so*; do
+      if [ -e "$f" ]; then
+        qml_needed=1
+        break
+      fi
+    done
   fi
 
-  # Symlink app-shipped QML modules (in lib/ outside lib/qt/) into the
-  # QML import path so they are discoverable alongside Qt's own modules.
-  # QML modules are identified by the presence of a qmldir file.
-  if [ -d "$out/lib/qt/qml" ] && [ -d "$out/lib" ]; then
-    while IFS= read -r qmldir; do
-      mod_dir="$(dirname "$qmldir")"
-      # Relative path from $out/lib, e.g. "Logos/Theme"
-      rel="${mod_dir#$out/lib/}"
-      # Skip anything already under qt/
-      [[ "$rel" == qt/* ]] && continue
-      if [ ! -e "$out/lib/qt/qml/$rel" ]; then
-        echo "  Symlinking app QML module: $rel"
-        link_parent="$(dirname "$out/lib/qt/qml/$rel")"
-        mkdir -p "$link_parent"
-        target="$(realpath --relative-to="$link_parent" "$mod_dir")"
-        ln -sf "$target" "$out/lib/qt/qml/$rel"
-      fi
-    done < <(find "$out/lib" -name 'qmldir' -not -path '*/qt/*')
+  qt_qml_found=0
+  if [ "$qml_needed" = "1" ]; then
+    echo "  Bundling QML modules..."
+    while IFS= read -r storePath; do
+      for candidate in "$storePath/lib/qt-6/qml" "$storePath/lib/qt-5/qml" "$storePath/share/qt-6/qml" "$storePath/share/qt-5/qml" "$storePath/lib/qt6/qml" "$storePath/lib/qt5/qml"; do
+        if [ -d "$candidate" ]; then
+          echo "  Found QML modules: $candidate"
+          mkdir -p "$out/lib/qt/qml"
+          # Merge contents (multiple store paths may contribute different modules)
+          cp -aLn "$candidate"/. "$out/lib/qt/qml/" 2>/dev/null || true
+          chmod -R u+w "$out/lib/qt/qml" 2>/dev/null || true
+          qt_qml_found=1
+        fi
+      done
+    done < "$CLOSURE_PATHS"
+
+    if [ "$qt_qml_found" = "1" ]; then
+      # Remove non-runtime files from QML modules to reduce bundle size:
+      #   - designer/ dirs: Qt Designer metadata and images (large)
+      #   - objects-Release/ dirs: CMake build artifacts
+      #   - Qt/test/: test utilities
+      #   - QtTest/: test framework
+      #   - QmlTime/: testing helper
+      #   - *.a, *.prl: static libraries and build metadata
+      echo "  Cleaning non-runtime QML files..."
+      qml_base="$out/lib/qt/qml"
+      qml_cleaned=0
+      # Remove directories that are never needed at runtime
+      for dir in \
+        "$qml_base/QtTest" \
+        "$qml_base/QmlTime" \
+        "$qml_base/Qt/test" \
+      ; do
+        if [ -d "$dir" ]; then
+          rm -rf "$dir"
+          qml_cleaned=$((qml_cleaned + 1))
+        fi
+      done
+      # Remove designer/ and objects-Release/ dirs anywhere in the tree
+      while IFS= read -r junk_dir; do
+        rm -rf "$junk_dir"
+        qml_cleaned=$((qml_cleaned + 1))
+      done < <(find "$qml_base" -type d \( -name 'designer' -o -name 'objects-Release' \) 2>/dev/null)
+      # Remove static libs and build metadata (not needed at runtime)
+      find "$qml_base" \( -name '*.a' -o -name '*.prl' -o -name '*.o' \) -delete 2>/dev/null || true
+      # Remove empty directories left over from cleanup
+      find "$qml_base" -type d -empty -delete 2>/dev/null || true
+      echo "  Removed $qml_cleaned non-runtime directories"
+
+      # Trace deps of shared libraries inside QML modules
+      echo "  Tracing QML module dependencies..."
+      while IFS= read -r qml_lib; do
+        trace_deps "$qml_lib"
+      done < <(find "$out/lib/qt/qml" -type f \( -name '*.dylib' -o -name '*.so' \))
+    fi
+
+    # Symlink app-shipped QML modules (in lib/ outside lib/qt/) into the
+    # QML import path so they are discoverable alongside Qt's own modules.
+    # QML modules are identified by the presence of a qmldir file.
+    if [ -d "$out/lib/qt/qml" ] && [ -d "$out/lib" ]; then
+      while IFS= read -r qmldir; do
+        mod_dir="$(dirname "$qmldir")"
+        # Relative path from $out/lib, e.g. "Logos/Theme"
+        rel="${mod_dir#$out/lib/}"
+        # Skip anything already under qt/
+        [[ "$rel" == qt/* ]] && continue
+        if [ ! -e "$out/lib/qt/qml/$rel" ]; then
+          echo "  Symlinking app QML module: $rel"
+          link_parent="$(dirname "$out/lib/qt/qml/$rel")"
+          mkdir -p "$link_parent"
+          target="$(realpath --relative-to="$link_parent" "$mod_dir")"
+          ln -sf "$target" "$out/lib/qt/qml/$rel"
+        fi
+      done < <(find "$out/lib" -name 'qmldir' -not -path '*/qt/*')
+    fi
+  else
+    echo "  Skipping QML bundling (no QtQml/QtQuick libraries detected)"
   fi
 
   # Create qt.conf so Qt can find plugins and QML modules relative to the binary
   if [ -d "$out/bin" ]; then
     echo "  Creating qt.conf..."
-    cat > "$out/bin/qt.conf" <<'QTCONF'
+    cat > "$out/bin/qt.conf" <<QTCONF
 [Paths]
 Prefix = ..
 Plugins = lib/qt/plugins
-QmlImports = lib/qt/qml
+$([ "$qt_qml_found" = "1" ] && echo "QmlImports = lib/qt/qml")
 QTCONF
   fi
 fi
