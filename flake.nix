@@ -26,10 +26,27 @@
               inherit drv warnOnBinaryData;
               name = drv.pname or drv.name or "bundle";
               extraDirs = drv.extraDirs or [];
+              hostLibs = drv.hostLibs or [];
             };
         in {
           default = bundle { warnOnBinaryData = false; };
           permissive = bundle { warnOnBinaryData = true; };
+          qtApp = drv:
+            mkBundle {
+              inherit drv;
+              name = drv.pname or drv.name or "bundle";
+              extraDirs = drv.extraDirs or [];
+              hostLibs = drv.hostLibs or [];
+              warnOnBinaryData = true;
+            };
+          qtPlugin = drv:
+            mkBundle {
+              inherit drv;
+              name = drv.pname or drv.name or "bundle";
+              extraDirs = drv.extraDirs or [];
+              hostLibs = (drv.hostLibs or []) ++ [ "Qt*" ];
+              warnOnBinaryData = true;
+            };
         });
     };
 }

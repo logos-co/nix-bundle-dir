@@ -3,18 +3,37 @@ set -euo pipefail
 
 mkdir -p "$out"
 
-# Build exclude patterns array
-exclude_patterns=()
-if [ -n "${EXCLUDE_LIBS:-}" ]; then
+# Build system library patterns array
+system_patterns=()
+if [ -n "${SYSTEM_LIBS:-}" ]; then
   while IFS= read -r pat; do
-    [ -n "$pat" ] && exclude_patterns+=("$pat")
-  done <<< "$EXCLUDE_LIBS"
+    [ -n "$pat" ] && system_patterns+=("$pat")
+  done <<< "$SYSTEM_LIBS"
 fi
 
-is_excluded() {
+is_system_lib() {
   local lib_name="$1"
-  for pat in "${exclude_patterns[@]+"${exclude_patterns[@]}"}"; do
+  for pat in "${system_patterns[@]+"${system_patterns[@]}"}"; do
     # Use bash glob matching
+    # shellcheck disable=SC2254
+    case "$lib_name" in
+      $pat) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Build host-provided library patterns array
+host_patterns=()
+if [ -n "${HOST_LIBS:-}" ]; then
+  while IFS= read -r pat; do
+    [ -n "$pat" ] && host_patterns+=("$pat")
+  done <<< "$HOST_LIBS"
+fi
+
+is_host_lib() {
+  local lib_name="$1"
+  for pat in "${host_patterns[@]+"${host_patterns[@]}"}"; do
     # shellcheck disable=SC2254
     case "$lib_name" in
       $pat) return 0 ;;
@@ -130,8 +149,8 @@ collect_lib() {
   [[ -z "${visited[$lib_path]:-}" ]] || return 0
   visited[$lib_path]=1
 
-  if is_excluded "$lib_name"; then
-    echo "  Skipping (excluded): $lib_name"
+  if is_system_lib "$lib_name"; then
+    echo "  Skipping (system): $lib_name"
     return 0
   fi
 
@@ -155,6 +174,12 @@ collect_lib() {
     fi
     framework_map[$lib_name]="$fw_relpath"
     framework_count=$((framework_count + 1))
+  fi
+
+  # Host-provided libs: record framework info (above) but don't copy
+  if is_host_lib "$lib_name"; then
+    echo "  Skipping (host-provided): $lib_name"
+    return 0
   fi
 
   # If the framework directory already exists (e.g. copied in Phase 1), skip the flat copy
@@ -302,10 +327,15 @@ fi
 # dependency trace. If we bundled any Qt library, search the closure for
 # the plugins directory, copy it, trace plugin deps, and create qt.conf.
 qt_detected=0
+qt_is_host=0
 if [ "$framework_count" -gt 0 ]; then
   for fw in "${!framework_map[@]}"; do
     if [[ "$fw" == Qt* ]]; then
       qt_detected=1
+      # Check if this Qt lib is host-provided (not bundled)
+      if is_host_lib "$fw"; then
+        qt_is_host=1
+      fi
       break
     fi
   done
@@ -320,7 +350,9 @@ if [ "$qt_detected" = "0" ] && [ -d "$out/lib" ]; then
   done
 fi
 
-if [ "$qt_detected" = "1" ]; then
+if [ "$qt_detected" = "1" ] && [ "$qt_is_host" = "1" ]; then
+  echo "Phase 2b: Skipping Qt plugin/QML bundling (Qt is host-provided)"
+elif [ "$qt_detected" = "1" ]; then
   echo "Phase 2b: Bundling Qt plugins..."
   qt_plugins_found=0
 
@@ -340,6 +372,13 @@ if [ "$qt_detected" = "1" ]; then
   done < "$CLOSURE_PATHS"
 
   if [ "$qt_plugins_found" = "1" ]; then
+    # Remove build artifacts from plugins (static libs, build metadata)
+    find "$out/lib/qt/plugins" \( -name '*.a' -o -name '*.prl' -o -name '*.o' \) -delete 2>/dev/null || true
+    while IFS= read -r junk_dir; do
+      rm -rf "$junk_dir"
+    done < <(find "$out/lib/qt/plugins" -type d -name 'objects-Release' 2>/dev/null)
+    find "$out/lib/qt/plugins" -type d -empty -delete 2>/dev/null || true
+
     # Trace deps of all plugin shared libraries
     echo "  Tracing plugin dependencies..."
     while IFS= read -r plugin; do
@@ -519,7 +558,16 @@ if [ "$IS_DARWIN" = "1" ]; then
       dep="$(echo "$line" | sed -E 's/^[[:space:]]*([^[:space:]]+).*/\1/')"
       if [[ "$dep" == /nix/store/* ]]; then
         lib_name="$(basename "$dep")"
-        if [[ -n "${framework_map[$lib_name]:-}" ]]; then
+        if is_host_lib "$lib_name"; then
+          # Host-provided lib — rewrite to @rpath/ so the host app resolves it
+          if [[ -n "${framework_map[$lib_name]:-}" ]]; then
+            install_name_tool -change "$dep" "@rpath/${framework_map[$lib_name]}" "$f" 2>/dev/null || \
+              echo "  Warning: install_name_tool -change failed for $dep in $f"
+          else
+            install_name_tool -change "$dep" "@rpath/$lib_name" "$f" 2>/dev/null || \
+              echo "  Warning: install_name_tool -change failed for $dep in $f"
+          fi
+        elif [[ -n "${framework_map[$lib_name]:-}" ]]; then
           # Framework lib — rewrite to @rpath/ so rpath resolves it
           local fw_rpath="@rpath/${framework_map[$lib_name]}"
           install_name_tool -change "$dep" "$fw_rpath" "$f" 2>/dev/null || \
@@ -527,8 +575,8 @@ if [ "$IS_DARWIN" = "1" ]; then
         elif [ -f "$out/lib/$lib_name" ] || [ -L "$out/lib/$lib_name" ]; then
           install_name_tool -change "$dep" "$lib_prefix/$lib_name" "$f" 2>/dev/null || \
             echo "  Warning: install_name_tool -change failed for $dep in $f"
-        elif is_excluded "$lib_name"; then
-          # Excluded system library — rewrite to /usr/lib/ (strip minor version)
+        elif is_system_lib "$lib_name"; then
+          # System library — rewrite to /usr/lib/ (strip minor version)
           local sys_path
           sys_path="$(macos_system_lib_path "$lib_name")"
           install_name_tool -change "$dep" "$sys_path" "$f" 2>/dev/null || \
@@ -536,14 +584,16 @@ if [ "$IS_DARWIN" = "1" ]; then
         fi
       elif [[ "$dep" == @rpath/* ]]; then
         local rpath_suffix="${dep#@rpath/}"
-        if [[ "$rpath_suffix" == *.framework/* ]]; then
+        lib_name="$(basename "$dep")"
+        if is_host_lib "$lib_name"; then
+          : # Host-provided — already an @rpath/ reference, leave as-is
+        elif [[ "$rpath_suffix" == *.framework/* ]]; then
           # Framework reference — keep @rpath/ intact if framework dir exists
           local fw_top="${rpath_suffix%%/*}"
           if [ -d "$out/lib/$fw_top" ]; then
             : # skip — rpath will resolve this
           else
             # Framework not restructured, rewrite to flat path
-            lib_name="$(basename "$dep")"
             if [ -f "$out/lib/$lib_name" ] || [ -L "$out/lib/$lib_name" ]; then
               install_name_tool -change "$dep" "$lib_prefix/$lib_name" "$f" 2>/dev/null || \
                 echo "  Warning: install_name_tool -change failed for $dep in $f"
@@ -551,7 +601,6 @@ if [ "$IS_DARWIN" = "1" ]; then
           fi
         else
           # Non-framework @rpath/ reference — rewrite to flat lib/ if we have the lib
-          lib_name="$(basename "$dep")"
           if [ -f "$out/lib/$lib_name" ] || [ -L "$out/lib/$lib_name" ]; then
             install_name_tool -change "$dep" "$lib_prefix/$lib_name" "$f" 2>/dev/null || \
               echo "  Warning: install_name_tool -change failed for $dep in $f"
@@ -593,7 +642,16 @@ if [ "$IS_DARWIN" = "1" ]; then
         fi
       fi
       if [ "$needs_rewrite" = "1" ]; then
-        if is_excluded "$id_name"; then
+        if is_host_lib "$id_name"; then
+          # Host-provided lib — set install name to @rpath/
+          if [[ -n "${framework_map[$id_name]:-}" ]]; then
+            install_name_tool -id "@rpath/${framework_map[$id_name]}" "$f" 2>/dev/null || \
+              echo "  Warning: install_name_tool -id failed for $f"
+          else
+            install_name_tool -id "@rpath/$id_name" "$f" 2>/dev/null || \
+              echo "  Warning: install_name_tool -id failed for $f"
+          fi
+        elif is_system_lib "$id_name"; then
           local sys_id_path
           sys_id_path="$(macos_system_lib_path "$id_name")"
           install_name_tool -id "$sys_id_path" "$f" 2>/dev/null || \
@@ -644,8 +702,8 @@ else
       if [ -f "$out/lib/$interp_name" ]; then
         patchelf --set-interpreter "$out/lib/$interp_name" "$f" 2>/dev/null || \
           echo "  Warning: patchelf --set-interpreter failed for $f"
-      elif is_excluded "$interp_name"; then
-        # Excluded system interpreter — rewrite to standard path
+      elif is_system_lib "$interp_name"; then
+        # System interpreter — rewrite to standard path
         sys_interp="/lib/$interp_name"
         [ -f "/lib64/$interp_name" ] && sys_interp="/lib64/$interp_name"
         patchelf --set-interpreter "$sys_interp" "$f" 2>/dev/null || \
