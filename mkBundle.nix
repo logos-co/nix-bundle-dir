@@ -2,9 +2,10 @@
 
 { drv
 , name ? drv.pname or drv.name or "bundle"
-, excludeLibs ? []
+, systemLibs ? []
+, hostLibs ? []
 , extraDirs ? []
-, useDefaultExcludes ? true
+, useDefaultSystemLibs ? true
 , warnOnBinaryData ? false
 }:
 
@@ -19,7 +20,7 @@ let
   # On macOS, system libraries live outside /nix/store (/usr/lib, /System/Library)
   # so they are already implicitly excluded by the dependency tracer. These defaults
   # only matter for Linux, where Nix builds its own copies of system libraries.
-  defaultExcludeLibs = pkgs.lib.optionals isDarwin [
+  defaultSystemLibs = pkgs.lib.optionals isDarwin [
     # macOS system libraries — provided by the OS at /usr/lib/
     "libSystem.B.dylib"
     "libc++.*.dylib"
@@ -80,7 +81,7 @@ let
     "libfribidi.so*"
   ];
 
-  allExcludeLibs = (if useDefaultExcludes then defaultExcludeLibs else []) ++ excludeLibs;
+  allSystemLibs = (if useDefaultSystemLibs then defaultSystemLibs else []) ++ systemLibs;
 in
 
 pkgs.stdenv.mkDerivation {
@@ -105,7 +106,8 @@ pkgs.stdenv.mkDerivation {
   CLOSURE_PATHS = "${closureInfo}/store-paths";
   DRV_PATH = "${drv}";
   IS_DARWIN = if isDarwin then "1" else "0";
-  EXCLUDE_LIBS = builtins.concatStringsSep "\n" allExcludeLibs;
+  SYSTEM_LIBS = builtins.concatStringsSep "\n" allSystemLibs;
+  HOST_LIBS = builtins.concatStringsSep "\n" hostLibs;
   EXTRA_DIRS = builtins.concatStringsSep "\n" extraDirs;
   WARN_ON_BINARY_DATA = if warnOnBinaryData then "1" else "0";
 
