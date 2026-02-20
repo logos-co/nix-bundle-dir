@@ -345,6 +345,10 @@ if [ "$qt_detected" = "0" ] && [ -d "$out/lib" ]; then
   for f in "$out"/lib/libQt*.so* "$out"/lib/libQt*.dylib; do
     if [ -e "$f" ]; then
       qt_detected=1
+      qt_lib_name="$(basename "$f")"
+      if is_host_lib "$qt_lib_name"; then
+        qt_is_host=1
+      fi
       break
     fi
   done
