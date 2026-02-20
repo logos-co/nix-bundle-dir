@@ -361,18 +361,20 @@ elif [ "$qt_detected" = "1" ]; then
   qt_plugins_found=0
 
   while IFS= read -r storePath; do
-    # Look for Qt plugin directories (qt-5/plugins, qt-6/plugins, or just plugins/platforms)
+    # Look for Qt plugin directories in every closure path and merge them.
+    # Different Qt modules ship plugins in separate store paths (e.g. qtbase
+    # has platforms/, qtsvg has iconengines/, qtnetwork has tls/, etc.), so we
+    # must not stop after the first match.
     for candidate in "$storePath/lib/qt-6/plugins" "$storePath/lib/qt-5/plugins" "$storePath/share/qt-6/plugins" "$storePath/share/qt-5/plugins" "$storePath/lib/qt6/plugins" "$storePath/lib/qt5/plugins"; do
-      if [ -d "$candidate/platforms" ]; then
+      if [ -d "$candidate" ]; then
         echo "  Found Qt plugins: $candidate"
         mkdir -p "$out/lib/qt/plugins"
-        cp -aL "$candidate"/* "$out/lib/qt/plugins/"
+        cp -aLn "$candidate"/. "$out/lib/qt/plugins/" 2>/dev/null || true
         chmod -R u+w "$out/lib/qt/plugins" 2>/dev/null || true
         qt_plugins_found=1
-        break
+        break  # only one candidate per store path
       fi
     done
-    [ "$qt_plugins_found" = "1" ] && break
   done < "$CLOSURE_PATHS"
 
   if [ "$qt_plugins_found" = "1" ]; then
