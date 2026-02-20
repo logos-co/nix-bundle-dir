@@ -818,7 +818,9 @@ WRAPPER_EOF
 
     cat >> "$elf" <<'WRAPPER_EOF'
 # Try direct execution first (works when the ELF interpreter path exists).
-exec "$REAL" "$@" 2>/dev/null
+if [ -x "/lib/$INTERP_NAME" ]; then
+  exec "$REAL" "$@"
+fi
 
 # Fallback: find the system dynamic linker and use it to launch the binary.
 for p in \
