@@ -714,10 +714,19 @@ else
         patchelf --set-interpreter "$out/lib/$interp_name" "$f" 2>/dev/null || \
           echo "  Warning: patchelf --set-interpreter failed for $f"
       elif is_system_lib "$interp_name"; then
-        # System interpreter — rewrite to standard path
-        sys_interp="/lib/$interp_name"
-        [ -f "/lib64/$interp_name" ] && sys_interp="/lib64/$interp_name"
-        patchelf --set-interpreter "$sys_interp" "$f" 2>/dev/null || \
+        # System interpreter — record for wrapper generation.
+        # Different distros place the dynamic linker at different paths
+        # (e.g. /lib64/ on Fedora, /lib/ on Ubuntu 25.10 aarch64,
+        # /lib/x86_64-linux-gnu/ on Ubuntu 24.04).  Rather than guessing
+        # a single path at build time, we generate a thin shell wrapper
+        # that probes several well-known paths at runtime.
+        if [[ "$f" == "$out/bin/"* ]]; then
+          # Store the interpreter name so Phase 5b can create the wrapper.
+          echo "$interp_name" > "$f.__interp__"
+        fi
+        # Still set a best-effort interpreter so the ELF can work without
+        # the wrapper on common distros (the wrapper overrides this).
+        patchelf --set-interpreter "/lib/$interp_name" "$f" 2>/dev/null || \
           echo "  Warning: patchelf --set-interpreter failed for $f"
       fi
     fi
@@ -761,6 +770,53 @@ for f in "$out"/bin/*; do
     fi
   fi
 done
+
+# ===========================================================================
+# Phase 5b — Generate interpreter wrappers for Linux ELF executables
+# ===========================================================================
+if [ "$IS_DARWIN" != "1" ] && [ -d "$out/bin" ]; then
+  echo "Phase 5b: Generating interpreter wrappers..."
+  for marker in "$out"/bin/*.__interp__; do
+    [ -f "$marker" ] || continue
+    interp_name="$(cat "$marker")"
+    elf="${marker%.__interp__}"
+    base="$(basename "$elf")"
+    hidden="$out/bin/.$base.elf"
+
+    mv "$elf" "$hidden"
+    rm "$marker"
+
+    cat > "$elf" <<'WRAPPER_EOF'
+#!/bin/sh
+# Auto-generated wrapper — finds the system dynamic linker at runtime.
+SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+WRAPPER_EOF
+
+    cat >> "$elf" <<WRAPPER_EOF
+REAL="\$SELF_DIR/.$base.elf"
+INTERP_NAME="$interp_name"
+WRAPPER_EOF
+
+    cat >> "$elf" <<'WRAPPER_EOF'
+for p in \
+    "/lib64/$INTERP_NAME" \
+    "/lib/$INTERP_NAME" \
+    "/lib/x86_64-linux-gnu/$INTERP_NAME" \
+    "/lib/aarch64-linux-gnu/$INTERP_NAME" \
+    "/usr/lib64/$INTERP_NAME" \
+    "/usr/lib/$INTERP_NAME"; do
+  if [ -x "$p" ]; then
+    exec "$p" "$REAL" "$@"
+  fi
+done
+# Fallback: try running the ELF directly (may work if /lib/ has a compat symlink)
+exec "$REAL" "$@"
+WRAPPER_EOF
+
+    chmod +x "$elf"
+    echo "  $base -> .$base.elf (wrapper)"
+  done
+fi
 
 # ===========================================================================
 # Phase 6 — Verify portability (check for non-portable references)
