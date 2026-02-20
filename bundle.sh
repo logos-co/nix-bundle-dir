@@ -790,10 +790,25 @@ if [ "$IS_DARWIN" != "1" ] && [ -d "$out/bin" ]; then
 
     cat > "$elf" <<'WRAPPER_EOF'
 #!/bin/sh
-# Auto-generated wrapper — finds the system dynamic linker at runtime
-# and ensures bundled libraries take precedence over LD_LIBRARY_PATH.
+# Auto-generated wrapper — ensures bundled libraries and Qt plugins are
+# found regardless of the host's LD_LIBRARY_PATH or interpreter layout.
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUNDLE_LIB="$SELF_DIR/../lib"
+
+# Prepend bundled libs so they take priority over LD_LIBRARY_PATH.
+# (patchelf sets DT_RUNPATH which is searched AFTER LD_LIBRARY_PATH,
+# so without this, stale system libs can shadow the bundled versions.)
+export LD_LIBRARY_PATH="$BUNDLE_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+# Qt plugin/QML paths — needed because when launched through the dynamic
+# linker, /proc/self/exe points to ld-linux.so, so Qt cannot find qt.conf
+# and its relative Plugins/QmlImports paths don't resolve.
+if [ -d "$BUNDLE_LIB/qt/plugins" ]; then
+  export QT_PLUGIN_PATH="$BUNDLE_LIB/qt/plugins${QT_PLUGIN_PATH:+:$QT_PLUGIN_PATH}"
+fi
+if [ -d "$BUNDLE_LIB/qt/qml" ]; then
+  export QML2_IMPORT_PATH="$BUNDLE_LIB/qt/qml${QML2_IMPORT_PATH:+:$QML2_IMPORT_PATH}"
+fi
 WRAPPER_EOF
 
     cat >> "$elf" <<WRAPPER_EOF
@@ -802,6 +817,10 @@ INTERP_NAME="$interp_name"
 WRAPPER_EOF
 
     cat >> "$elf" <<'WRAPPER_EOF'
+# Try direct execution first (works when the ELF interpreter path exists).
+exec "$REAL" "$@" 2>/dev/null
+
+# Fallback: find the system dynamic linker and use it to launch the binary.
 for p in \
     "/lib64/$INTERP_NAME" \
     "/lib/$INTERP_NAME" \
@@ -810,15 +829,11 @@ for p in \
     "/usr/lib64/$INTERP_NAME" \
     "/usr/lib/$INTERP_NAME"; do
   if [ -x "$p" ]; then
-    # Use --library-path so bundled libs take priority over LD_LIBRARY_PATH.
-    # Without this, DT_RUNPATH (set by patchelf) is searched AFTER
-    # LD_LIBRARY_PATH, so stale system Qt or other libs can shadow
-    # the versions shipped in the bundle.
-    exec "$p" --library-path "$BUNDLE_LIB" "$REAL" "$@"
+    exec "$p" "$REAL" "$@"
   fi
 done
-# Fallback: try running the ELF directly (may work if /lib/ has a compat symlink)
-exec "$REAL" "$@"
+echo "Error: cannot find system dynamic linker ($INTERP_NAME)" >&2
+exit 1
 WRAPPER_EOF
 
     chmod +x "$elf"
