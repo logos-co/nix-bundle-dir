@@ -696,6 +696,13 @@ else
     patchelf --set-rpath "\$ORIGIN/$rel_to_lib" "$f" 2>/dev/null || \
       echo "  Warning: patchelf --set-rpath failed for $f"
 
+    # Fix unversioned libvulkan.so NEEDED (Nix links against the unversioned
+    # name, but non-dev Linux systems only ship libvulkan.so.1).
+    if patchelf --print-needed "$f" 2>/dev/null | grep -qx 'libvulkan.so'; then
+      patchelf --replace-needed libvulkan.so libvulkan.so.1 "$f" 2>/dev/null || \
+        echo "  Warning: patchelf --replace-needed libvulkan.so failed for $f"
+    fi
+
     interp="$(patchelf --print-interpreter "$f" 2>/dev/null)" || true
     if [[ -n "${interp:-}" && "$interp" == /nix/store/* ]]; then
       interp_name="$(basename "$interp")"
