@@ -788,8 +788,10 @@ if [ "$IS_DARWIN" != "1" ] && [ -d "$out/bin" ]; then
 
     cat > "$elf" <<'WRAPPER_EOF'
 #!/bin/sh
-# Auto-generated wrapper — finds the system dynamic linker at runtime.
+# Auto-generated wrapper — finds the system dynamic linker at runtime
+# and ensures bundled libraries take precedence over LD_LIBRARY_PATH.
 SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUNDLE_LIB="$SELF_DIR/../lib"
 WRAPPER_EOF
 
     cat >> "$elf" <<WRAPPER_EOF
@@ -806,7 +808,11 @@ for p in \
     "/usr/lib64/$INTERP_NAME" \
     "/usr/lib/$INTERP_NAME"; do
   if [ -x "$p" ]; then
-    exec "$p" "$REAL" "$@"
+    # Use --library-path so bundled libs take priority over LD_LIBRARY_PATH.
+    # Without this, DT_RUNPATH (set by patchelf) is searched AFTER
+    # LD_LIBRARY_PATH, so stale system Qt or other libs can shadow
+    # the versions shipped in the bundle.
+    exec "$p" --library-path "$BUNDLE_LIB" "$REAL" "$@"
   fi
 done
 # Fallback: try running the ELF directly (may work if /lib/ has a compat symlink)
