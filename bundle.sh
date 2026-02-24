@@ -702,6 +702,18 @@ else
     patchelf --set-rpath "\$ORIGIN/$rel_to_lib" "$f" 2>/dev/null || \
       echo "  Warning: patchelf --set-rpath failed for $f"
 
+    # Rewrite absolute /nix/store NEEDED entries to bare library names.
+    # Nix can embed full store paths in DT_NEEDED (e.g. /nix/store/.../libfoo.so).
+    # The dynamic linker resolves absolute NEEDED paths directly, bypassing
+    # rpath entirely, so they must be converted to bare names.
+    while IFS= read -r needed_entry; do
+      if [[ "$needed_entry" == /nix/store/* ]]; then
+        bare_name="$(basename "$needed_entry")"
+        patchelf --replace-needed "$needed_entry" "$bare_name" "$f" 2>/dev/null || \
+          echo "  Warning: patchelf --replace-needed failed for $needed_entry in $f"
+      fi
+    done < <(patchelf --print-needed "$f" 2>/dev/null)
+
     # Fix unversioned libvulkan.so NEEDED (Nix links against the unversioned
     # name, but non-dev Linux systems only ship libvulkan.so.1).
     if patchelf --print-needed "$f" 2>/dev/null | grep -qx 'libvulkan.so'; then
@@ -922,10 +934,15 @@ check_elf() {
     echo "1" >> "$test_dir/.errors"
   fi
 
-  # Check NEEDED libs resolve (using the copied tree)
+  # Check NEEDED entries for absolute /nix/store paths
   local needed
   needed="$(patchelf --print-needed "$f" 2>/dev/null)" || true
-  # We don't fail on NEEDED since they're bare names resolved via rpath
+  for lib_name in $needed; do
+    if [[ "$lib_name" == /nix/store/* ]]; then
+      echo "  ERROR: $rel has non-portable NEEDED entry: $lib_name"
+      echo "1" >> "$test_dir/.errors"
+    fi
+  done
 }
 
 find "$test_dir" -type f | while IFS= read -r f; do
