@@ -789,6 +789,84 @@ done
 # Phase 5b — Generate interpreter wrappers for Linux ELF executables
 # ===========================================================================
 if [ "$IS_DARWIN" != "1" ] && [ -d "$out/bin" ]; then
+  # Build a tiny LD_PRELOAD shim that fixes /proc/self/exe when the binary
+  # is launched through the dynamic linker (exec ld-linux.so binary).
+  # In that case the kernel sets /proc/self/exe to the interpreter, breaking
+  # QCoreApplication::applicationDirPath() and anything else that reads it.
+  # The shim intercepts readlink(at)("/proc/self/exe") and returns the real
+  # binary path from the __BUNDLE_REAL_EXE environment variable.
+  _procself_shim="$out/lib/libprocself_fix.so"
+  _need_shim=0
+  for _m in "$out"/bin/*.__interp__; do
+    [ -f "$_m" ] && _need_shim=1 && break
+  done
+  if [ "$_need_shim" = 1 ]; then
+    echo "Phase 5b: Building /proc/self/exe shim..."
+    _shim_src="$(mktemp --suffix=.c)"
+    cat > "$_shim_src" << 'SHIM_C'
+#define _GNU_SOURCE
+#include <string.h>
+#include <dlfcn.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+
+static const char *get_real_exe(void) {
+    return getenv("__BUNDLE_REAL_EXE");
+}
+
+static int is_proc_self_exe(const char *path) {
+    return path && (strcmp(path, "/proc/self/exe") == 0);
+}
+
+static int is_proc_self_exe_at(int dirfd, const char *path) {
+    if (dirfd == AT_FDCWD)
+        return is_proc_self_exe(path);
+    /* /proc/self/exe as an absolute path ignores dirfd */
+    if (path && path[0] == '/')
+        return is_proc_self_exe(path);
+    return 0;
+}
+
+static ssize_t spoof(char *buf, size_t bufsiz) {
+    const char *exe = get_real_exe();
+    if (!exe)
+        return -1;
+    size_t len = strlen(exe);
+    if (len > bufsiz)
+        len = bufsiz;
+    memcpy(buf, exe, len);
+    return (ssize_t)len;
+}
+
+ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
+    if (is_proc_self_exe(path)) {
+        ssize_t r = spoof(buf, bufsiz);
+        if (r >= 0) return r;
+    }
+    ssize_t (*next)(const char *, char *, size_t) = dlsym(RTLD_NEXT, "readlink");
+    return next(path, buf, bufsiz);
+}
+
+ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
+    if (is_proc_self_exe_at(dirfd, path)) {
+        ssize_t r = spoof(buf, bufsiz);
+        if (r >= 0) return r;
+    }
+    ssize_t (*next)(int, const char *, char *, size_t) = dlsym(RTLD_NEXT, "readlinkat");
+    return next(dirfd, path, buf, bufsiz);
+}
+SHIM_C
+    cc -shared -fPIC -O2 -o "$_procself_shim" "$_shim_src" -ldl
+    strip --strip-unneeded "$_procself_shim" 2>/dev/null || true
+    # The Nix toolchain bakes /nix/store rpaths into the compiled shim.
+    # Clear them — the shim only depends on libc/libdl (system libs).
+    patchelf --remove-rpath "$_procself_shim" 2>/dev/null || true
+    rm -f "$_shim_src"
+    echo "  Built $(basename "$_procself_shim")"
+  fi
+
   echo "Phase 5b: Generating interpreter wrappers..."
   for marker in "$out"/bin/*.__interp__; do
     [ -f "$marker" ] || continue
@@ -835,6 +913,15 @@ if [ -x "/lib/$INTERP_NAME" ]; then
 fi
 
 # Fallback: find the system dynamic linker and use it to launch the binary.
+# When launched this way, /proc/self/exe points to the interpreter (ld-linux)
+# instead of the actual binary, breaking QCoreApplication::applicationDirPath()
+# and anything else that reads /proc/self/exe.  Load a tiny LD_PRELOAD shim
+# that intercepts readlink("/proc/self/exe") and returns the real binary path.
+PROCSELF_SHIM="$BUNDLE_LIB/libprocself_fix.so"
+if [ -f "$PROCSELF_SHIM" ]; then
+  export __BUNDLE_REAL_EXE="$REAL"
+  export LD_PRELOAD="$PROCSELF_SHIM${LD_PRELOAD:+:$LD_PRELOAD}"
+fi
 for p in \
     "/lib64/$INTERP_NAME" \
     "/lib/$INTERP_NAME" \
