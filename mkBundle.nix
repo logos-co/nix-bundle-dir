@@ -5,12 +5,13 @@
 , systemLibs ? []
 , hostLibs ? []
 , extraDirs ? []
+, extraClosurePaths ? []
 , useDefaultSystemLibs ? true
 , warnOnBinaryData ? false
 }:
 
 let
-  closureInfo = pkgs.closureInfo { rootPaths = [ drv ]; };
+  closureInfo = pkgs.closureInfo { rootPaths = [ drv ] ++ extraClosurePaths; };
   isDarwin = pkgs.stdenv.isDarwin;
 
   # Default system libraries that should not be bundled.
@@ -96,6 +97,7 @@ pkgs.stdenv.mkDerivation {
     coreutils
     findutils
     file
+    glib  # glib-compile-schemas for Phase 2c (gsettings schema compilation)
   ] ++ pkgs.lib.optionals isDarwin [
     darwin.cctools
     darwin.sigtool

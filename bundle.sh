@@ -504,6 +504,71 @@ QTCONF
   fi
 fi
 
+# ===========================================================================
+# Phase 2c — Bundle GLib gsettings schemas (if GIO is present)
+# ===========================================================================
+gio_detected=0
+if [ -d "$out/lib" ]; then
+  for f in "$out"/lib/libgio-2.0.so* "$out"/lib/libgio-2.0*.dylib; do
+    if [ -e "$f" ]; then
+      gio_detected=1
+      break
+    fi
+  done
+fi
+
+if [ "$gio_detected" = "1" ]; then
+  echo "Phase 2c: Bundling gsettings schemas..."
+  schemas_dir="$out/share/glib-2.0/schemas"
+  schema_files_found=0
+
+  while IFS= read -r storePath; do
+    # Search both the standard path and the Nix-specific path where packages
+    # like gsettings-desktop-schemas install schemas:
+    #   share/glib-2.0/schemas/
+    #   share/gsettings-schemas/<name>/glib-2.0/schemas/
+    schema_dirs=()
+    if [ -d "$storePath/share/glib-2.0/schemas" ]; then
+      schema_dirs+=("$storePath/share/glib-2.0/schemas")
+    fi
+    while IFS= read -r nix_schema_dir; do
+      schema_dirs+=("$nix_schema_dir")
+    done < <(find "$storePath/share/gsettings-schemas" -path '*/glib-2.0/schemas' -type d 2>/dev/null)
+
+    for src in "${schema_dirs[@]+"${schema_dirs[@]}"}"; do
+      has_schema=0
+      for f in "$src"/*.xml "$src"/*.gschema.override; do
+        if [ -e "$f" ]; then
+          has_schema=1
+          break
+        fi
+      done
+      if [ "$has_schema" = "1" ]; then
+        echo "  Found schemas: $src"
+        mkdir -p "$schemas_dir"
+        cp -an "$src"/*.xml "$schemas_dir/" 2>/dev/null || true
+        cp -an "$src"/*.gschema.override "$schemas_dir/" 2>/dev/null || true
+        schema_files_found=1
+      fi
+    done
+  done < "$CLOSURE_PATHS"
+
+  if [ "$schema_files_found" = "1" ]; then
+    # glib-compile-schemas is provided via nativeBuildInputs (glib)
+    if command -v glib-compile-schemas >/dev/null 2>&1; then
+      echo "  Compiling schemas..."
+      glib-compile-schemas "$schemas_dir"
+      # Remove source XML files — only the compiled binary is needed at runtime
+      find "$schemas_dir" \( -name '*.xml' -o -name '*.gschema.override' \) -delete
+      echo "  Compiled gschemas.compiled"
+    else
+      echo "  Warning: glib-compile-schemas not found in closure, skipping schema compilation"
+    fi
+  else
+    echo "  No schema files found in closure"
+  fi
+fi
+
 # Restructure framework libraries into proper .framework directory layout.
 # This must run after all dependency tracing (Phase 2, 2b, extra dirs) so that
 # every framework collected as a flat file gets restructured.
@@ -898,6 +963,12 @@ if [ -d "$BUNDLE_LIB/qt/plugins" ]; then
 fi
 if [ -d "$BUNDLE_LIB/qt/qml" ]; then
   export QML2_IMPORT_PATH="$BUNDLE_LIB/qt/qml${QML2_IMPORT_PATH:+:$QML2_IMPORT_PATH}"
+fi
+if [ -d "$BUNDLE_LIB/../share" ]; then
+  export XDG_DATA_DIRS="$BUNDLE_LIB/../share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
+fi
+if [ -d "$BUNDLE_LIB/../share/glib-2.0/schemas" ]; then
+  export GSETTINGS_SCHEMA_DIR="$BUNDLE_LIB/../share/glib-2.0/schemas"
 fi
 WRAPPER_EOF
 
