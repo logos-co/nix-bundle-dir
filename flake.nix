@@ -27,6 +27,7 @@
               inherit drv warnOnBinaryData;
               name = drv.pname or drv.name or "bundle";
               extraDirs = drv.extraDirs or [];
+              extraClosurePaths = drv.extraClosurePaths or [];
               hostLibs = drv.hostLibs or [];
             };
         in {
@@ -37,6 +38,7 @@
               inherit drv;
               name = drv.pname or drv.name or "bundle";
               extraDirs = drv.extraDirs or [];
+              extraClosurePaths = drv.extraClosurePaths or [];
               hostLibs = drv.hostLibs or [];
               warnOnBinaryData = true;
             };
@@ -45,6 +47,7 @@
               inherit drv;
               name = drv.pname or drv.name or "bundle";
               extraDirs = drv.extraDirs or [];
+              extraClosurePaths = drv.extraClosurePaths or [];
               hostLibs = (drv.hostLibs or []) ++ [ "Qt*" ];
               warnOnBinaryData = true;
             };

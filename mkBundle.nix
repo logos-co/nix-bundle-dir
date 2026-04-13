@@ -5,12 +5,18 @@
 , systemLibs ? []
 , hostLibs ? []
 , extraDirs ? []
+, extraClosurePaths ? []
 , useDefaultSystemLibs ? true
 , warnOnBinaryData ? false
 }:
 
 let
-  closureInfo = pkgs.closureInfo { rootPaths = [ drv ]; };
+  # Extra closure paths allow the caller to inject store paths into the
+  # dependency closure that the bundler scans for Qt plugins, QML modules,
+  # and shared libraries.  This is needed when the derivation's output
+  # doesn't reference a dependency directly (e.g. a Qt module used only by
+  # portable-bundled plugins whose nix-store references were stripped).
+  closureInfo = pkgs.closureInfo { rootPaths = [ drv ] ++ extraClosurePaths; };
   isDarwin = pkgs.stdenv.isDarwin;
 
   # Default system libraries that should not be bundled.
