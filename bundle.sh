@@ -504,6 +504,43 @@ QTCONF
   fi
 fi
 
+# ===========================================================================
+# Phase 2c — Bundle xkeyboard-config data (if libxkbcommon is present)
+# ===========================================================================
+# libxkbcommon is compiled with DFLT_XKB_CONFIG_ROOT pointing at a /nix/store
+# xkeyboard-config path that won't exist at runtime.  Without this data the
+# context init returns NULL, and Qt Wayland's keymap dispatch dereferences it
+# and segfaults.  Copy the data into share/X11/xkb so consumers can point
+# XKB_CONFIG_ROOT at it.
+xkb_detected=0
+if [ -d "$out/lib" ]; then
+  for f in "$out"/lib/libxkbcommon.so* "$out"/lib/libxkbcommon*.dylib; do
+    if [ -e "$f" ]; then
+      xkb_detected=1
+      break
+    fi
+  done
+fi
+
+if [ "$xkb_detected" = "1" ]; then
+  echo "Phase 2c: Bundling xkeyboard-config data..."
+  xkb_found=0
+  while IFS= read -r storePath; do
+    for candidate in "$storePath/etc/X11/xkb" "$storePath/share/X11/xkb"; do
+      if [ -d "$candidate" ]; then
+        echo "  Found xkb data: $candidate"
+        mkdir -p "$out/share/X11/xkb"
+        cp -aLn "$candidate"/. "$out/share/X11/xkb/" 2>/dev/null || true
+        chmod -R u+w "$out/share/X11/xkb" 2>/dev/null || true
+        xkb_found=1
+      fi
+    done
+  done < "$CLOSURE_PATHS"
+  if [ "$xkb_found" = "0" ]; then
+    echo "  Warning: libxkbcommon bundled but no xkeyboard-config data found in closure"
+  fi
+fi
+
 # Restructure framework libraries into proper .framework directory layout.
 # This must run after all dependency tracing (Phase 2, 2b, extra dirs) so that
 # every framework collected as a flat file gets restructured.
@@ -898,6 +935,13 @@ if [ -d "$BUNDLE_LIB/qt/plugins" ]; then
 fi
 if [ -d "$BUNDLE_LIB/qt/qml" ]; then
   export QML2_IMPORT_PATH="$BUNDLE_LIB/qt/qml${QML2_IMPORT_PATH:+:$QML2_IMPORT_PATH}"
+fi
+
+# xkeyboard-config data path — libxkbcommon was built with a hardcoded
+# /nix/store path that won't exist at runtime; without this, Qt Wayland's
+# keymap dispatch segfaults on a NULL xkb context.
+if [ -d "$SELF_DIR/../share/X11/xkb" ]; then
+  export XKB_CONFIG_ROOT="$SELF_DIR/../share/X11/xkb"
 fi
 WRAPPER_EOF
 
