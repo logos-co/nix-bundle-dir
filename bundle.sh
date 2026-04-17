@@ -492,13 +492,22 @@ elif [ "$qt_detected" = "1" ]; then
     echo "  Skipping QML bundling (no QtQml/QtQuick libraries detected)"
   fi
 
-  # Create qt.conf so Qt can find plugins and QML modules relative to the binary
+  # Create qt.conf so Qt can find plugins and QML modules relative to the binary.
+  # LibraryExecutables / Data / Translations are set explicitly because the
+  # compile-time defaults in some Qt builds (notably nixpkgs qt6) use paths
+  # like "libexec/qt6", while our bundle lays things out at the Qt 6 defaults
+  # ("libexec", ".", "translations") relative to Prefix.  QtWebEngine looks up
+  # QtWebEngineProcess via LibraryExecutablesPath and its .pak/icudtl.dat via
+  # DataPath + "/resources", so getting these wrong breaks the webview plugin.
   if [ -d "$out/bin" ]; then
     echo "  Creating qt.conf..."
     cat > "$out/bin/qt.conf" <<QTCONF
 [Paths]
 Prefix = ..
 Plugins = lib/qt/plugins
+LibraryExecutables = libexec
+Data = .
+Translations = translations
 $([ "$qt_qml_found" = "1" ] && echo "QmlImports = lib/qt/qml")
 QTCONF
   fi
@@ -538,6 +547,116 @@ if [ "$xkb_detected" = "1" ]; then
   done < "$CLOSURE_PATHS"
   if [ "$xkb_found" = "0" ]; then
     echo "  Warning: libxkbcommon bundled but no xkeyboard-config data found in closure"
+  fi
+fi
+
+# ===========================================================================
+# Phase 2d — Bundle QtWebEngine runtime data (if QtWebEngineCore is present)
+# ===========================================================================
+# QtWebEngine needs three sets of runtime files that live outside lib/ and
+# lib/qt/plugins, so Phase 1/2/2b don't pick them up:
+#   - libexec/QtWebEngineProcess: the sandboxed helper process (forked per webview)
+#   - resources/*.pak + icudtl.dat: Chromium resource bundles and ICU data
+#   - translations/qtwebengine_locales/*.pak: localized strings
+# Without the helper binary in particular, QtWebView::initialize() fails and
+# the webview plugin registry reports "No WebView plug-in found!".
+# Qt locates them via qt.conf's Prefix (libexec, resources, translations are
+# Qt's default LibraryExecutables / Data / Translations paths).
+webengine_detected=0
+if [ "$framework_count" -gt 0 ]; then
+  for fw in "${!framework_map[@]}"; do
+    if [[ "$fw" == QtWebEngineCore* ]]; then
+      webengine_detected=1
+      break
+    fi
+  done
+fi
+if [ "$webengine_detected" = "0" ] && [ -d "$out/lib" ]; then
+  for f in "$out"/lib/libQt*WebEngineCore*.so* "$out"/lib/libQt*WebEngineCore*.dylib; do
+    if [ -e "$f" ]; then
+      webengine_detected=1
+      break
+    fi
+  done
+fi
+
+if [ "$webengine_detected" = "1" ]; then
+  echo "Phase 2d: Bundling QtWebEngine runtime data..."
+  webengine_process_found=0
+  webengine_resources_found=0
+  webengine_locales_found=0
+  while IFS= read -r storePath; do
+    # QtWebEngineProcess helper binary
+    for candidate in \
+      "$storePath/libexec/QtWebEngineProcess" \
+      "$storePath/lib/qt-6/libexec/QtWebEngineProcess" \
+      "$storePath/lib/qt-5/libexec/QtWebEngineProcess" \
+      "$storePath/Library/QtWebEngineCore.framework/Helpers/QtWebEngineProcess.app/Contents/MacOS/QtWebEngineProcess" \
+      "$storePath/lib/QtWebEngineCore.framework/Helpers/QtWebEngineProcess.app/Contents/MacOS/QtWebEngineProcess" \
+    ; do
+      if [ -f "$candidate" ]; then
+        echo "  Found QtWebEngineProcess: $candidate"
+        mkdir -p "$out/libexec"
+        if [ ! -e "$out/libexec/QtWebEngineProcess" ]; then
+          cp -aL "$candidate" "$out/libexec/QtWebEngineProcess"
+          chmod u+w "$out/libexec/QtWebEngineProcess" 2>/dev/null || true
+        fi
+        webengine_process_found=1
+        break
+      fi
+    done
+    # Resources (.pak files + icudtl.dat).  Heuristic: directory must contain
+    # icudtl.dat or a qtwebengine_*.pak to avoid copying unrelated resources/.
+    for candidate in \
+      "$storePath/resources" \
+      "$storePath/share/qt-6/resources" \
+      "$storePath/share/qt-5/resources" \
+      "$storePath/lib/qt-6/resources" \
+      "$storePath/lib/qt-5/resources" \
+    ; do
+      if [ -d "$candidate" ]; then
+        if [ -f "$candidate/icudtl.dat" ] || ls "$candidate"/qtwebengine*.pak >/dev/null 2>&1; then
+          echo "  Found QtWebEngine resources: $candidate"
+          mkdir -p "$out/resources"
+          cp -aLn "$candidate"/. "$out/resources/" 2>/dev/null || true
+          chmod -R u+w "$out/resources" 2>/dev/null || true
+          webengine_resources_found=1
+        fi
+      fi
+    done
+    # Locales
+    for candidate in \
+      "$storePath/translations/qtwebengine_locales" \
+      "$storePath/share/qt-6/translations/qtwebengine_locales" \
+      "$storePath/share/qt-5/translations/qtwebengine_locales" \
+      "$storePath/lib/qt-6/translations/qtwebengine_locales" \
+      "$storePath/lib/qt-5/translations/qtwebengine_locales" \
+    ; do
+      if [ -d "$candidate" ]; then
+        echo "  Found QtWebEngine locales: $candidate"
+        mkdir -p "$out/translations/qtwebengine_locales"
+        cp -aLn "$candidate"/. "$out/translations/qtwebengine_locales/" 2>/dev/null || true
+        chmod -R u+w "$out/translations" 2>/dev/null || true
+        webengine_locales_found=1
+      fi
+    done
+  done < "$CLOSURE_PATHS"
+
+  if [ "$webengine_process_found" = "0" ]; then
+    echo "  Warning: QtWebEngineCore bundled but QtWebEngineProcess not found in closure"
+  fi
+  if [ "$webengine_resources_found" = "0" ]; then
+    echo "  Warning: QtWebEngineCore bundled but resources (.pak/icudtl.dat) not found in closure"
+  fi
+  if [ "$webengine_locales_found" = "0" ]; then
+    echo "  Warning: QtWebEngineCore bundled but locales not found in closure"
+  fi
+
+  # Trace QtWebEngineProcess deps so its libraries get bundled and patched.
+  # Phase 3 will then rewrite its interpreter and rpath like any other ELF.
+  if [ -f "$out/libexec/QtWebEngineProcess" ]; then
+    echo "  Tracing QtWebEngineProcess dependencies..."
+    trace_deps "$out/libexec/QtWebEngineProcess"
   fi
 fi
 
