@@ -1038,7 +1038,27 @@ SHIM_C
 #!/bin/sh
 # Auto-generated wrapper — ensures bundled libraries and Qt plugins are
 # found regardless of the host's LD_LIBRARY_PATH or interpreter layout.
-SELF_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Resolve our own directory robustly.  When a parent (e.g. boost::process v2,
+# Qt's QProcess, or an AppImage runtime that inherits the user's cwd) spawns
+# us via PATH resolution or with a bare-name argv[0], `$0` can be just the
+# command name and `dirname "$0"` returns ".", which then `cd`s into the
+# caller's cwd — *not* our install dir.  Fall back to a PATH search so
+# sibling files (the hidden .elf, BUNDLE_LIB) are always found.
+_self_resolve() {
+  case "$1" in
+    /*) printf '%s\n' "$1" ;;
+    */*) printf '%s\n' "$PWD/$1" ;;
+    *)
+      _r="$(command -v "$1" 2>/dev/null || true)"
+      case "$_r" in
+        /*) printf '%s\n' "$_r" ;;
+        *)  printf '%s\n' "$PWD/$1" ;;
+      esac
+      ;;
+  esac
+}
+SELF_DIR="$(cd "$(dirname "$(_self_resolve "$0")")" 2>/dev/null && pwd)"
 BUNDLE_LIB="$SELF_DIR/../lib"
 
 # Prepend bundled libs so they take priority over LD_LIBRARY_PATH.
@@ -1070,6 +1090,15 @@ INTERP_NAME="$interp_name"
 WRAPPER_EOF
 
     cat >> "$elf" <<'WRAPPER_EOF'
+# Always update __BUNDLE_REAL_EXE to *this* process's real binary before exec.
+# Children inherit env from the parent, so if a parent wrapper took the
+# ld-linux fallback and exported __BUNDLE_REAL_EXE + LD_PRELOAD, a child that
+# takes the direct-exec path below would inherit the parent's shim with the
+# *parent's* path — making readlink("/proc/self/exe") in the child return the
+# parent's binary (causing e.g. logos_host subprocesses to report their exe
+# as .LogosBasecamp.elf).  Setting it here keeps the shim honest either way.
+export __BUNDLE_REAL_EXE="$REAL"
+
 # Try direct execution first (works when the ELF interpreter path exists).
 if [ -x "/lib/$INTERP_NAME" ]; then
   exec "$REAL" "$@"
@@ -1082,7 +1111,6 @@ fi
 # that intercepts readlink("/proc/self/exe") and returns the real binary path.
 PROCSELF_SHIM="$BUNDLE_LIB/libprocself_fix.so"
 if [ -f "$PROCSELF_SHIM" ]; then
-  export __BUNDLE_REAL_EXE="$REAL"
   export LD_PRELOAD="$PROCSELF_SHIM${LD_PRELOAD:+:$LD_PRELOAD}"
 fi
 for p in \
