@@ -834,7 +834,13 @@ if [ "$IS_DARWIN" = "1" ]; then
       install_name_tool -delete_rpath "$rpath" "$f" 2>/dev/null || true
     done
 
-    # Add rpath pointing to our lib/ relative to this binary
+    # Add two rpath entries: same-dir first (@loader_path), then $out/lib.
+    # The @loader_path entry lets binaries outside $out/lib find sibling
+    # companion libraries co-located with them (e.g. module plugins and
+    # their companion .dylib files staged together in $out/modules/<name>/).
+    # Without it, a plugin with `@rpath/libfoo.dylib` references would only
+    # search $out/lib and fail to find a sibling libfoo.dylib.
+    install_name_tool -add_rpath "@loader_path" "$f" 2>/dev/null || true
     install_name_tool -add_rpath "$lib_prefix" "$f" 2>/dev/null || true
   }
 
@@ -855,7 +861,15 @@ else
     f_dir="$(dirname "$f")"
     rel_to_lib="$(loader_path_to_lib "$f_dir")"
 
-    patchelf --set-rpath "\$ORIGIN/$rel_to_lib" "$f" 2>/dev/null || \
+    # Set rpath to: same-dir first, then $out/lib.
+    # The same-dir entry ($ORIGIN) lets binaries outside $out/lib find sibling
+    # companion libraries co-located with them.  Example: module plugins at
+    # $out/modules/<name>/<name>_plugin.so ship their companion .so files in
+    # the same module directory — without $ORIGIN the linker only checks
+    # $out/lib and fails with "cannot open shared object file".
+    # When $f lives in $out/lib itself, $rel_to_lib is "." so the two entries
+    # resolve to the same directory — harmless duplication.
+    patchelf --set-rpath "\$ORIGIN:\$ORIGIN/$rel_to_lib" "$f" 2>/dev/null || \
       echo "  Warning: patchelf --set-rpath failed for $f"
 
     # Rewrite absolute /nix/store NEEDED entries to bare library names.
@@ -1193,7 +1207,8 @@ check_elf() {
     unset IFS
     for entry in "${rpath_entries[@]}"; do
       case "$entry" in
-        '$ORIGIN'/*|'${ORIGIN}'/*) ;; # portable
+        '$ORIGIN'|'${ORIGIN}') ;; # portable (same directory as the binary)
+        '$ORIGIN'/*|'${ORIGIN}'/*) ;; # portable (relative to binary directory)
         /lib/*|/lib64/*|/usr/lib/*|/usr/lib64/*) ;; # system paths
         '') ;; # empty
         *)
