@@ -1048,31 +1048,63 @@ SHIM_C
     mv "$elf" "$hidden"
     rm "$marker"
 
-    cat > "$elf" <<'WRAPPER_EOF'
+    cat > "$elf" <<WRAPPER_EOF
 #!/bin/sh
 # Auto-generated wrapper — ensures bundled libraries and Qt plugins are
 # found regardless of the host's LD_LIBRARY_PATH or interpreter layout.
+BASE="$base"
+WRAPPER_EOF
 
+    cat >> "$elf" <<'WRAPPER_EOF'
 # Resolve our own directory robustly.  When a parent (e.g. boost::process v2,
 # Qt's QProcess, or an AppImage runtime that inherits the user's cwd) spawns
-# us via PATH resolution or with a bare-name argv[0], `$0` can be just the
-# command name and `dirname "$0"` returns ".", which then `cd`s into the
-# caller's cwd — *not* our install dir.  Fall back to a PATH search so
-# sibling files (the hidden .elf, BUNDLE_LIB) are always found.
-_self_resolve() {
+# us via PATH resolution or with a bare-name / relative argv[0], `$0` can be
+# something that resolves against the caller's cwd — *not* our install dir.
+# We anchor on a ground truth: our install dir is the one that contains the
+# hidden companion ELF ".$BASE.elf" next to us.  Try argv[0]-based resolution
+# first, then fall back to a PATH walk looking for that companion — AppImage
+# AppRun and similar wrappers always prepend our bin dir to PATH, so this
+# fallback is reliable even when argv[0] is wrong.
+_find_self_dir() {
+  # Attempt 1: resolve via $1 ($0).
+  _candidate=""
   case "$1" in
-    /*) printf '%s\n' "$1" ;;
-    */*) printf '%s\n' "$PWD/$1" ;;
+    /*)  _candidate="$1" ;;
+    */*) _candidate="$PWD/$1" ;;
     *)
       _r="$(command -v "$1" 2>/dev/null || true)"
       case "$_r" in
-        /*) printf '%s\n' "$_r" ;;
-        *)  printf '%s\n' "$PWD/$1" ;;
+        /*) _candidate="$_r" ;;
+        *)  _candidate="$PWD/$1" ;;
       esac
       ;;
   esac
+  if [ -n "$_candidate" ]; then
+    _d="$(cd "$(dirname "$_candidate")" 2>/dev/null && pwd)" || _d=""
+    if [ -n "$_d" ] && [ -f "$_d/.$BASE.elf" ]; then
+      printf '%s\n' "$_d"
+      return 0
+    fi
+  fi
+  # Attempt 2: search PATH for a directory containing our companion ELF.
+  _old_ifs="$IFS"
+  IFS=:
+  for _p in $PATH; do
+    if [ -n "$_p" ] && [ -f "$_p/.$BASE.elf" ]; then
+      IFS="$_old_ifs"
+      # Canonicalise (PATH entries can be relative).
+      _d="$(cd "$_p" 2>/dev/null && pwd)" && [ -n "$_d" ] && { printf '%s\n' "$_d"; return 0; }
+    fi
+  done
+  IFS="$_old_ifs"
+  # Last resort: best-effort fallback, whatever it resolves to.
+  if [ -n "$_candidate" ]; then
+    (cd "$(dirname "$_candidate")" 2>/dev/null && pwd) || printf '%s\n' "$PWD"
+  else
+    printf '%s\n' "$PWD"
+  fi
 }
-SELF_DIR="$(cd "$(dirname "$(_self_resolve "$0")")" 2>/dev/null && pwd)"
+SELF_DIR="$(_find_self_dir "$0")"
 BUNDLE_LIB="$SELF_DIR/../lib"
 
 # Prepend bundled libs so they take priority over LD_LIBRARY_PATH.
@@ -1099,8 +1131,11 @@ fi
 WRAPPER_EOF
 
     cat >> "$elf" <<WRAPPER_EOF
-REAL="\$SELF_DIR/.$base.elf"
 INTERP_NAME="$interp_name"
+WRAPPER_EOF
+
+    cat >> "$elf" <<'WRAPPER_EOF'
+REAL="$SELF_DIR/.$BASE.elf"
 WRAPPER_EOF
 
     cat >> "$elf" <<'WRAPPER_EOF'
