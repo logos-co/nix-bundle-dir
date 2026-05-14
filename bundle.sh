@@ -1031,8 +1031,28 @@ SHIM_C
     cc -shared -fPIC -O2 -o "$_procself_shim" "$_shim_src" -ldl
     strip --strip-unneeded "$_procself_shim" 2>/dev/null || true
     # The Nix toolchain bakes /nix/store rpaths into the compiled shim.
-    # Clear them — the shim only depends on libc/libdl (system libs).
+    # Clear the DT_RUNPATH entry — the shim only depends on libc/libdl
+    # (system libs), and the bundle wrapper sets LD_LIBRARY_PATH at
+    # runtime anyway.
     patchelf --remove-rpath "$_procself_shim" 2>/dev/null || true
+    # patchelf --remove-rpath drops the tag from .dynamic but leaves the
+    # literal /nix/store strings orphaned in .dynstr, where Phase 6's
+    # strings-based portability scan still finds them. Zero those bytes
+    # in place; they're unreferenced after the rpath tag removal, so
+    # this is safe.
+    LC_ALL=C strings -a -t d "$_procself_shim" 2>/dev/null \
+      | while read -r _off _str; do
+          case "$_str" in
+            *"/nix/store/"*)
+              _prefix="${_str%%/nix/store*}"
+              _nix_off=$((_off + ${#_prefix}))
+              _tail_len=$(( ${#_str} - ${#_prefix} ))
+              dd if=/dev/zero of="$_procself_shim" \
+                 bs=1 seek="$_nix_off" count="$_tail_len" \
+                 conv=notrunc 2>/dev/null
+              ;;
+          esac
+        done
     rm -f "$_shim_src"
     echo "  Built $(basename "$_procself_shim")"
   fi
