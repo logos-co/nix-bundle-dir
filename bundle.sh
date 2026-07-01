@@ -258,6 +258,11 @@ trace_deps() {
     unset IFS
 
     for lib_name in $needed; do
+      # Nix sometimes embeds absolute store paths in DT_NEEDED; handle inline.
+      if [[ "$lib_name" == /nix/store/* ]] && [ -f "$lib_name" ]; then
+        collect_lib "$lib_name"
+        continue
+      fi
       local found=0
       for dir in "${rpath_dirs[@]}"; do
         [[ "$dir" == /nix/store/* ]] || continue
@@ -1117,6 +1122,12 @@ export LD_LIBRARY_PATH="$BUNDLE_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 # and its relative Plugins/QmlImports paths don't resolve.
 if [ -d "$BUNDLE_LIB/qt/plugins" ]; then
   export QT_PLUGIN_PATH="$BUNDLE_LIB/qt/plugins${QT_PLUGIN_PATH:+:$QT_PLUGIN_PATH}"
+
+  # Route Qt file dialogs through xdg-desktop-portal so the host's own file chooser renders.
+  if [ -f "$BUNDLE_LIB/qt/plugins/platformthemes/libqxdgdesktopportal.so" ] \
+       && [ -z "${QT_QPA_PLATFORMTHEME:-}" ]; then
+    export QT_QPA_PLATFORMTHEME="xdgdesktopportal"
+  fi
 fi
 if [ -d "$BUNDLE_LIB/qt/qml" ]; then
   export QML2_IMPORT_PATH="$BUNDLE_LIB/qt/qml${QML2_IMPORT_PATH:+:$QML2_IMPORT_PATH}"
