@@ -64,8 +64,14 @@ is_portable_ref() {
 echo "Phase 1: Copying executables and libraries..."
 if [ -d "$DRV_PATH/bin" ]; then
   mkdir -p "$out/bin"
-  for f in "$DRV_PATH"/bin/*; do
+  # `*` does not match dotfiles, and a bundle that already went through
+  # Phase 5b has its real ELFs hidden as `.<name>.elf` beside each launcher.
+  # Without the second glob, re-bundling an already-bundled tree copies the
+  # launchers and silently drops the binaries they exec — leaving a bin/ whose
+  # entries fail with a bare ENOENT.
+  for f in "$DRV_PATH"/bin/* "$DRV_PATH"/bin/.*; do
     [ -e "$f" ] || continue
+    case "$(basename "$f")" in .|..) continue ;; esac
     cp -aL "$f" "$out/bin/"
   done
   chmod -R u+w "$out/bin" 2>/dev/null || true
@@ -878,14 +884,24 @@ else
   # cross-built.  e_machine is a 2-byte field at offset 0x12; both machines we
   # recognise are little-endian, so the low byte comes first.
   psabi_interpreter() {
-    local machine
+    local machine elfclass
     machine="$(od -An -tx1 -j18 -N2 "$1" 2>/dev/null | tr -d ' \n')"
+    # EI_CLASS (offset 0x04): 01 = 32-bit, 02 = 64-bit.  It matters because
+    # x32 shares EM_X86_64 with plain x86-64 while being a 32-bit object; it
+    # needs /libx32/ld-linux-x32.so.2 and would crash on the 64-bit loader.
+    # We don't claim an x32 path (unverified), we just decline to guess.
+    elfclass="$(od -An -tx1 -j4 -N1 "$1" 2>/dev/null | tr -d ' \n')"
     case "$machine" in
-      3e00) echo "/lib64/ld-linux-x86-64.so.2" ;; # EM_X86_64
-      b700) echo "/lib/ld-linux-aarch64.so.1"  ;; # EM_AARCH64
-      # Any other architecture: we have no verified psABI path, so return
+      3e00) [ "$elfclass" = "02" ] || return 1
+            echo "/lib64/ld-linux-x86-64.so.2" ;; # EM_X86_64, 64-bit
+      b700) [ "$elfclass" = "02" ] || return 1
+            echo "/lib/ld-linux-aarch64.so.1"  ;; # EM_AARCH64, 64-bit
+      # Any other architecture: we have no VERIFIED psABI path, so return
       # nothing and let the caller keep the previous best-effort behaviour
-      # rather than guess a path that is probably wrong.
+      # rather than guess.  The question is settled only for the two arches
+      # above — i386, armhf, riscv64 and s390x happen to match the old
+      # /lib/<name> fallback, but ppc64le does not (its psABI is
+      # /lib64/ld64.so.2), so none of them are claimed here.
       *) return 1 ;;
     esac
   }
@@ -1041,8 +1057,25 @@ done
 #
 # So: emit a launcher only when xkb data was actually bundled, and only to
 # export environment.  It never involves ld.so.
+# The launcher is emitted when the bundle needs ANY environment variable set
+# that the libraries cannot work out for themselves.  Today there are two, and
+# they are independent:
+#
+#   XKB_CONFIG_ROOT        libxkbcommon has its config root baked to a
+#                          /nix/store path that will not exist at runtime.
+#   QT_QPA_PLATFORMTHEME   the xdg-desktop-portal theme has to be chosen by
+#                          name; bundling the plugin is not enough.
+#
+# Gating both on xkb alone would mean a bundle that ships the portal plugin
+# without libxkbcommon silently loses its host file dialogs, with nothing in
+# the build log to say so.  So each contributes its own reason to emit.
+_need_xkb=0
+if [ "$xkb_detected" = "1" ] && [ -d "$out/share/X11/xkb" ]; then _need_xkb=1; fi
+_need_theme=0
+if [ -f "$out/lib/qt/plugins/platformthemes/libqxdgdesktopportal.so" ]; then _need_theme=1; fi
+
 if [ "$IS_DARWIN" != "1" ] && [ -d "$out/bin" ] \
-     && [ "$xkb_detected" = "1" ] && [ -d "$out/share/X11/xkb" ]; then
+     && { [ "$_need_xkb" = "1" ] || [ "$_need_theme" = "1" ]; }; then
   echo "Phase 5b: Generating environment launchers..."
 
   for f in "$out"/bin/*; do
@@ -1065,12 +1098,17 @@ if [ "$IS_DARWIN" != "1" ] && [ -d "$out/bin" ] \
     # for a program that never opens a display.
     mv "$f" "$real"
 
+    # The companion's own interpreter, so the launcher can say something
+    # useful when a host does not have it (see the preflight below).
+    launcher_interp="$(patchelf --print-interpreter "$real" 2>/dev/null || true)"
+
     cat > "$f" <<LAUNCHER_HEAD
 #!/bin/sh
 # Auto-generated launcher.  Sets the environment the bundled libraries cannot
 # derive from their own location, then execs the real binary directly — never
 # through ld.so, so /proc/self/exe and argv[0] stay honest.
 BASE="$base"
+INTERP="$launcher_interp"
 LAUNCHER_HEAD
 
     cat >> "$f" <<'LAUNCHER_BODY'
@@ -1144,6 +1182,18 @@ fi
 
 REAL="$SELF_DIR/.$BASE.elf"
 
+# The old launcher probed for the loader and said so when it found none.  exec
+# below would instead fail with ENOENT naming $REAL — the kernel reporting the
+# missing *interpreter*, not the missing file — which is precisely the
+# unreadable symptom this change exists to stop producing.  One stat is cheap.
+if [ -n "$INTERP" ] && [ ! -e "$INTERP" ]; then
+  echo "$BASE: this bundle needs the system dynamic linker at $INTERP, which" >&2
+  echo "  does not exist on this host.  That path is mandated by the platform" >&2
+  echo "  ABI, so a glibc system should have it; musl systems (Alpine) cannot" >&2
+  echo "  run these binaries at all." >&2
+  exit 1
+fi
+
 # Exec the real ELF directly.  Its PT_INTERP is the psABI loader path, which
 # exists on every glibc host, so there is nothing to probe and no reason to
 # hand the program to ld.so.  The kernel therefore records $REAL as the
@@ -1153,6 +1203,13 @@ REAL="$SELF_DIR/.$BASE.elf"
 # script path it resolved, so that $0 is always a real, runnable path to this
 # launcher — a program that re-execs itself from argv[0] lands back here and
 # keeps its environment instead of starting the bare ELF.
+#
+# Note what this does NOT cover: /proc/self/exe is $REAL, not this script, so a
+# program that re-execs from /proc/self/exe restarts the bare ELF and loses the
+# environment set above.  Such a caller has to map `.<name>.elf` back to
+# `<name>` itself (logos-logoscore-cli's paths.cpp does exactly that).  Both
+# identities are honest here — they simply answer different questions — but
+# only argv[0] round-trips through the launcher.
 #
 # `exec -a` is a bashism, and /bin/sh is dash on Debian/Ubuntu and busybox ash
 # on a few others — both reject it.  We keep the /bin/sh shebang (the only
