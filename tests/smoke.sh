@@ -17,6 +17,14 @@
 set -uo pipefail
 
 FLAKE="${1:-.}"
+# Absolutise a local flake ref before we cd into the scratch dir, or `.` would
+# resolve to the scratch dir and nix would report "could not find a flake.nix".
+# A ref containing ':' is a URL (github:, git+https:, path:) and is left alone.
+case "$FLAKE" in
+  *:*) ;;
+  *)   FLAKE="$(cd "$FLAKE" 2>/dev/null && pwd)" || { echo "smoke: no such flake dir: ${1:-.}" >&2; exit 1; } ;;
+esac
+
 WORK="$(mktemp -d)"
 trap 'chmod -R u+w "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT
 cd "$WORK"
