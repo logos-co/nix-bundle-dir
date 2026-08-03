@@ -858,6 +858,38 @@ if [ "$IS_DARWIN" = "1" ]; then
 
 else
 
+  # Map an ELF's own machine type to the dynamic loader path its psABI
+  # mandates.  Every glibc distro puts the loader exactly there — it is not a
+  # packaging convention but part of the ABI, so a binary built anywhere can
+  # name it and be run anywhere.  Swept and confirmed present on ubuntu
+  # 16.04/18.04/20.04/22.04, debian 9/10/11, centos 7, rocky 8, fedora
+  # 34/latest, opensuse leap and archlinux, on both architectures.  (Only musl
+  # distros such as alpine lack it, and glibc binaries can't run there anyway.)
+  #
+  # The two paths deliberately do NOT rhyme, and the next reader's instinct
+  # will be to "simplify" them to a single /lib64 prefix.  Don't:
+  # /lib64/ld-linux-aarch64.so.1 does not exist on current Fedora or openSUSE,
+  # so a /lib64 prefix for both arches silently breaks every arm64 bundle.
+  # Likewise /lib/ld-linux-x86-64.so.2 is missing on 10 of those 11 x86_64
+  # images.  The prefix is per-architecture and must stay that way.
+  #
+  # We read the machine out of the ELF header rather than assuming the
+  # builder's own architecture, because a bundle can in principle be
+  # cross-built.  e_machine is a 2-byte field at offset 0x12; both machines we
+  # recognise are little-endian, so the low byte comes first.
+  psabi_interpreter() {
+    local machine
+    machine="$(od -An -tx1 -j18 -N2 "$1" 2>/dev/null | tr -d ' \n')"
+    case "$machine" in
+      3e00) echo "/lib64/ld-linux-x86-64.so.2" ;; # EM_X86_64
+      b700) echo "/lib/ld-linux-aarch64.so.1"  ;; # EM_AARCH64
+      # Any other architecture: we have no verified psABI path, so return
+      # nothing and let the caller keep the previous best-effort behaviour
+      # rather than guess a path that is probably wrong.
+      *) return 1 ;;
+    esac
+  }
+
   find "$out" -type f | while IFS= read -r f; do
     filetype="$(file -b "$f" 2>/dev/null)" || continue
     [[ "$filetype" == *ELF* ]] || continue
@@ -874,7 +906,24 @@ else
     # $out/lib and fails with "cannot open shared object file".
     # When $f lives in $out/lib itself, $rel_to_lib is "." so the two entries
     # resolve to the same directory — harmless duplication.
-    patchelf --set-rpath "\$ORIGIN:\$ORIGIN/$rel_to_lib" "$f" 2>/dev/null || \
+    #
+    # --force-rpath writes DT_RPATH instead of patchelf's default DT_RUNPATH.
+    # The difference matters twice over:
+    #   1. DT_RUNPATH is searched *after* LD_LIBRARY_PATH, so a stale host
+    #      entry shadows the bundled libraries.  Measured: with DT_RUNPATH a
+    #      decoy LD_LIBRARY_PATH shadows the bundled Qt ("file too short");
+    #      with DT_RPATH the same binary ignores the decoy and runs.  This is
+    #      what let us delete the launcher's LD_LIBRARY_PATH export.
+    #   2. DT_RPATH is inherited by the whole dependency chain, DT_RUNPATH is
+    #      not — a bundled library whose own dependency was pulled in
+    #      indirectly still resolves.
+    # We apply it to *every* ELF, not just the executables: dlopen'd Qt
+    # plugins and module .so files are loaded with no executable of ours in
+    # the picture, so each one has to carry its own search path, and each is
+    # equally exposed to a hostile LD_LIBRARY_PATH.  The cost is that a user
+    # can no longer LD_LIBRARY_PATH their way into overriding a bundled
+    # library — which is precisely the point of a self-contained bundle.
+    patchelf --force-rpath --set-rpath "\$ORIGIN:\$ORIGIN/$rel_to_lib" "$f" 2>/dev/null || \
       echo "  Warning: patchelf --set-rpath failed for $f"
 
     # Rewrite absolute /nix/store NEEDED entries to bare library names.
@@ -903,20 +952,25 @@ else
         patchelf --set-interpreter "$out/lib/$interp_name" "$f" 2>/dev/null || \
           echo "  Warning: patchelf --set-interpreter failed for $f"
       elif is_system_lib "$interp_name"; then
-        # System interpreter — record for wrapper generation.
-        # Different distros place the dynamic linker at different paths
-        # (e.g. /lib64/ on Fedora, /lib/ on Ubuntu 25.10 aarch64,
-        # /lib/x86_64-linux-gnu/ on Ubuntu 24.04).  Rather than guessing
-        # a single path at build time, we generate a thin shell wrapper
-        # that probes several well-known paths at runtime.
-        if [[ "$f" == "$out/bin/"* ]]; then
-          # Store the interpreter name so Phase 5b can create the wrapper.
-          echo "$interp_name" > "$f.__interp__"
+        # System interpreter — point it at the path this architecture's psABI
+        # mandates.  That path is knowable at build time, so the ELF stays a
+        # plain, directly-executable binary: the kernel records it (not a
+        # loader) as the process image, /proc/self/exe is the truth, argv[0]
+        # is whatever the caller passed, and a program that re-execs itself
+        # gets itself.  An earlier design shipped every executable hidden
+        # behind a shell launcher that ran it as `exec ld.so ./the-binary`;
+        # that broke all three of those, and cost a real bug where a daemon
+        # re-exec'd itself into the hidden ELF and died with ENOENT.
+        if psabi_interp="$(psabi_interpreter "$f")"; then
+          patchelf --set-interpreter "$psabi_interp" "$f" 2>/dev/null || \
+            echo "  Warning: patchelf --set-interpreter failed for $f"
+        else
+          # Architecture we have no verified psABI path for.  Keep the old
+          # best-effort guess rather than inventing one; it is at least no
+          # worse than what shipped before.
+          patchelf --set-interpreter "/lib/$interp_name" "$f" 2>/dev/null || \
+            echo "  Warning: patchelf --set-interpreter failed for $f"
         fi
-        # Still set a best-effort interpreter so the ELF can work without
-        # the wrapper on common distros (the wrapper overrides this).
-        patchelf --set-interpreter "/lib/$interp_name" "$f" 2>/dev/null || \
-          echo "  Warning: patchelf --set-interpreter failed for $f"
       fi
     fi
   done
@@ -961,115 +1015,74 @@ for f in "$out"/bin/*; do
 done
 
 # ===========================================================================
-# Phase 5b — Generate interpreter wrappers for Linux ELF executables
+# Phase 5b — Generate launchers for executables that need runtime environment
 # ===========================================================================
-if [ "$IS_DARWIN" != "1" ] && [ -d "$out/bin" ]; then
-  # Build a tiny LD_PRELOAD shim that fixes /proc/self/exe when the binary
-  # is launched through the dynamic linker (exec ld-linux.so binary).
-  # In that case the kernel sets /proc/self/exe to the interpreter, breaking
-  # QCoreApplication::applicationDirPath() and anything else that reads it.
-  # The shim intercepts readlink(at)("/proc/self/exe") and returns the real
-  # binary path from the __BUNDLE_REAL_EXE environment variable.
-  _procself_shim="$out/lib/libprocself_fix.so"
-  _need_shim=0
-  for _m in "$out"/bin/*.__interp__; do
-    [ -f "$_m" ] && _need_shim=1 && break
-  done
-  if [ "$_need_shim" = 1 ]; then
-    echo "Phase 5b: Building /proc/self/exe shim..."
-    _shim_src="$(mktemp --suffix=.c)"
-    cat > "$_shim_src" << 'SHIM_C'
-#define _GNU_SOURCE
-#include <string.h>
-#include <dlfcn.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <errno.h>
+# Phase 3 gives every ELF a psABI interpreter and a DT_RPATH, so the ordinary
+# case needs no launcher at all: the binary in bin/ *is* the binary, it starts
+# directly, and Qt finds bin/qt.conf because /proc/self/exe finally tells the
+# truth.  (That is also why QT_PLUGIN_PATH and QML2_IMPORT_PATH are gone:
+# qt.conf's relative Plugins/QmlImports paths only failed to resolve because
+# the old launcher ran the program through ld.so, which made /proc/self/exe
+# point at the loader.  Verified on a real Fedora Wayland desktop with both
+# variables unset: the wayland platform plugin, its xdg-shell / decoration /
+# EGL integrations, the xdgdesktopportal platform theme and QtQuick's
+# qtquick2plugin all load from the bundle, and no host Qt library is mapped.
+# LD_LIBRARY_PATH is gone for the DT_RPATH reason above.)
+#
+# What is left is the one thing no ELF header can express: libxkbcommon is
+# compiled with DFLT_XKB_CONFIG_ROOT baked to a /nix/store path that does not
+# exist on the target, and its lookup has no relative-to-the-binary fallback.
+# Without XKB_CONFIG_ROOT, Qt Wayland's keymap dispatch dereferences a NULL
+# xkb context and segfaults — proven by controlled experiment on a real
+# Fedora Wayland session, same binary, unset -> SIGSEGV, set -> runs.  Note
+# that containers cannot reproduce that failure (under Xvfb the keymap comes
+# from the X server; headless weston has no seat, so no keymap is ever sent),
+# so a green container run is not evidence that this launcher is unnecessary.
+#
+# So: emit a launcher only when xkb data was actually bundled, and only to
+# export environment.  It never involves ld.so.
+if [ "$IS_DARWIN" != "1" ] && [ -d "$out/bin" ] \
+     && [ "$xkb_detected" = "1" ] && [ -d "$out/share/X11/xkb" ]; then
+  echo "Phase 5b: Generating environment launchers..."
 
-static const char *get_real_exe(void) {
-    return getenv("__BUNDLE_REAL_EXE");
-}
+  for f in "$out"/bin/*; do
+    [ -f "$f" ] || continue
+    filetype="$(file -b "$f" 2>/dev/null)" || continue
+    [[ "$filetype" == *ELF* ]] || continue
+    # Only executables get a launcher.  Presence of PT_INTERP is the reliable
+    # discriminator: shared objects don't have one, and `file` reports PIE
+    # executables as "shared object" on older versions, so its wording can't
+    # be trusted here.
+    [ -n "$(patchelf --print-interpreter "$f" 2>/dev/null || true)" ] || continue
 
-static int is_proc_self_exe(const char *path) {
-    return path && (strcmp(path, "/proc/self/exe") == 0);
-}
+    base="$(basename "$f")"
+    real="$out/bin/.$base.elf"
 
-static int is_proc_self_exe_at(int dirfd, const char *path) {
-    if (dirfd == AT_FDCWD)
-        return is_proc_self_exe(path);
-    /* /proc/self/exe as an absolute path ignores dirfd */
-    if (path && path[0] == '/')
-        return is_proc_self_exe(path);
-    return 0;
-}
+    # Every executable in bin/ gets the launcher, not just the GUI ones.  We
+    # cannot tell them apart reliably (an app's DT_NEEDED usually doesn't
+    # mention libxkbcommon — the Qt platform plugin pulls it in at dlopen
+    # time), guessing wrong means a segfault, and XKB_CONFIG_ROOT is inert
+    # for a program that never opens a display.
+    mv "$f" "$real"
 
-static ssize_t spoof(char *buf, size_t bufsiz) {
-    const char *exe = get_real_exe();
-    if (!exe)
-        return -1;
-    size_t len = strlen(exe);
-    if (len > bufsiz)
-        len = bufsiz;
-    memcpy(buf, exe, len);
-    return (ssize_t)len;
-}
-
-ssize_t readlink(const char *path, char *buf, size_t bufsiz) {
-    if (is_proc_self_exe(path)) {
-        ssize_t r = spoof(buf, bufsiz);
-        if (r >= 0) return r;
-    }
-    ssize_t (*next)(const char *, char *, size_t) = dlsym(RTLD_NEXT, "readlink");
-    return next(path, buf, bufsiz);
-}
-
-ssize_t readlinkat(int dirfd, const char *path, char *buf, size_t bufsiz) {
-    if (is_proc_self_exe_at(dirfd, path)) {
-        ssize_t r = spoof(buf, bufsiz);
-        if (r >= 0) return r;
-    }
-    ssize_t (*next)(int, const char *, char *, size_t) = dlsym(RTLD_NEXT, "readlinkat");
-    return next(dirfd, path, buf, bufsiz);
-}
-SHIM_C
-    cc -shared -fPIC -O2 -o "$_procself_shim" "$_shim_src" -ldl
-    strip --strip-unneeded "$_procself_shim" 2>/dev/null || true
-    # The Nix toolchain bakes /nix/store rpaths into the compiled shim.
-    # Clear them — the shim only depends on libc/libdl (system libs).
-    patchelf --remove-rpath "$_procself_shim" 2>/dev/null || true
-    rm -f "$_shim_src"
-    echo "  Built $(basename "$_procself_shim")"
-  fi
-
-  echo "Phase 5b: Generating interpreter wrappers..."
-  for marker in "$out"/bin/*.__interp__; do
-    [ -f "$marker" ] || continue
-    interp_name="$(cat "$marker")"
-    elf="${marker%.__interp__}"
-    base="$(basename "$elf")"
-    hidden="$out/bin/.$base.elf"
-
-    mv "$elf" "$hidden"
-    rm "$marker"
-
-    cat > "$elf" <<WRAPPER_EOF
+    cat > "$f" <<LAUNCHER_HEAD
 #!/bin/sh
-# Auto-generated wrapper — ensures bundled libraries and Qt plugins are
-# found regardless of the host's LD_LIBRARY_PATH or interpreter layout.
+# Auto-generated launcher.  Sets the environment the bundled libraries cannot
+# derive from their own location, then execs the real binary directly — never
+# through ld.so, so /proc/self/exe and argv[0] stay honest.
 BASE="$base"
-WRAPPER_EOF
+LAUNCHER_HEAD
 
-    cat >> "$elf" <<'WRAPPER_EOF'
+    cat >> "$f" <<'LAUNCHER_BODY'
 # Resolve our own directory robustly.  When a parent (e.g. boost::process v2,
 # Qt's QProcess, or an AppImage runtime that inherits the user's cwd) spawns
 # us via PATH resolution or with a bare-name / relative argv[0], `$0` can be
 # something that resolves against the caller's cwd — *not* our install dir.
 # We anchor on a ground truth: our install dir is the one that contains the
-# hidden companion ELF ".$BASE.elf" next to us.  Try argv[0]-based resolution
-# first, then fall back to a PATH walk looking for that companion — AppImage
-# AppRun and similar wrappers always prepend our bin dir to PATH, so this
-# fallback is reliable even when argv[0] is wrong.
+# companion ELF ".$BASE.elf" next to us.  Try argv[0]-based resolution first,
+# then fall back to a PATH walk looking for that companion — AppImage AppRun
+# and similar wrappers always prepend our bin dir to PATH, so this fallback is
+# reliable even when argv[0] is wrong.
 _find_self_dir() {
   # Attempt 1: resolve via $1 ($0).
   _candidate=""
@@ -1110,86 +1123,57 @@ _find_self_dir() {
   fi
 }
 SELF_DIR="$(_find_self_dir "$0")"
-BUNDLE_LIB="$SELF_DIR/../lib"
-
-# Prepend bundled libs so they take priority over LD_LIBRARY_PATH.
-# (patchelf sets DT_RUNPATH which is searched AFTER LD_LIBRARY_PATH,
-# so without this, stale system libs can shadow the bundled versions.)
-export LD_LIBRARY_PATH="$BUNDLE_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-
-# Qt plugin/QML paths — needed because when launched through the dynamic
-# linker, /proc/self/exe points to ld-linux.so, so Qt cannot find qt.conf
-# and its relative Plugins/QmlImports paths don't resolve.
-if [ -d "$BUNDLE_LIB/qt/plugins" ]; then
-  export QT_PLUGIN_PATH="$BUNDLE_LIB/qt/plugins${QT_PLUGIN_PATH:+:$QT_PLUGIN_PATH}"
-
-  # Route Qt file dialogs through xdg-desktop-portal so the host's own file chooser renders.
-  if [ -f "$BUNDLE_LIB/qt/plugins/platformthemes/libqxdgdesktopportal.so" ] \
-       && [ -z "${QT_QPA_PLATFORMTHEME:-}" ]; then
-    export QT_QPA_PLATFORMTHEME="xdgdesktopportal"
-  fi
-fi
-if [ -d "$BUNDLE_LIB/qt/qml" ]; then
-  export QML2_IMPORT_PATH="$BUNDLE_LIB/qt/qml${QML2_IMPORT_PATH:+:$QML2_IMPORT_PATH}"
-fi
 
 # xkeyboard-config data path — libxkbcommon was built with a hardcoded
 # /nix/store path that won't exist at runtime; without this, Qt Wayland's
-# keymap dispatch segfaults on a NULL xkb context.
+# keymap dispatch segfaults on a NULL xkb context.  This is the only reason
+# this launcher exists.
 if [ -d "$SELF_DIR/../share/X11/xkb" ]; then
   export XKB_CONFIG_ROOT="$SELF_DIR/../share/X11/xkb"
 fi
-WRAPPER_EOF
 
-    cat >> "$elf" <<WRAPPER_EOF
-INTERP_NAME="$interp_name"
-WRAPPER_EOF
+# Route Qt file dialogs through xdg-desktop-portal so the host's own file
+# chooser renders.  Unlike XKB_CONFIG_ROOT this isn't needed for correctness —
+# Qt finds the plugin via qt.conf on its own — but the theme has to be *chosen*
+# by name, and nothing in the bundle can do that for us.  Only set it when the
+# plugin is actually bundled and the user hasn't picked a theme themselves.
+if [ -f "$SELF_DIR/../lib/qt/plugins/platformthemes/libqxdgdesktopportal.so" ] \
+     && [ -z "${QT_QPA_PLATFORMTHEME:-}" ]; then
+  export QT_QPA_PLATFORMTHEME="xdgdesktopportal"
+fi
 
-    cat >> "$elf" <<'WRAPPER_EOF'
 REAL="$SELF_DIR/.$BASE.elf"
-WRAPPER_EOF
 
-    cat >> "$elf" <<'WRAPPER_EOF'
-# Always update __BUNDLE_REAL_EXE to *this* process's real binary before exec.
-# Children inherit env from the parent, so if a parent wrapper took the
-# ld-linux fallback and exported __BUNDLE_REAL_EXE + LD_PRELOAD, a child that
-# takes the direct-exec path below would inherit the parent's shim with the
-# *parent's* path — making readlink("/proc/self/exe") in the child return the
-# parent's binary (causing e.g. logos_host subprocesses to report their exe
-# as .LogosBasecamp.elf).  Setting it here keeps the shim honest either way.
-export __BUNDLE_REAL_EXE="$REAL"
-
-# Try direct execution first (works when the ELF interpreter path exists).
-if [ -x "/lib/$INTERP_NAME" ]; then
-  exec "$REAL" "$@"
+# Exec the real ELF directly.  Its PT_INTERP is the psABI loader path, which
+# exists on every glibc host, so there is nothing to probe and no reason to
+# hand the program to ld.so.  The kernel therefore records $REAL as the
+# process image: /proc/self/exe resolves to it (Qt's applicationDirPath and
+# hence qt.conf work), and `exec -a` passes on our own $0 rather than the
+# companion's dotted name.  For a #! script the kernel rewrites argv[0] to the
+# script path it resolved, so that $0 is always a real, runnable path to this
+# launcher — a program that re-execs itself from argv[0] lands back here and
+# keeps its environment instead of starting the bare ELF.
+#
+# `exec -a` is a bashism, and /bin/sh is dash on Debian/Ubuntu and busybox ash
+# on a few others — both reject it.  We keep the /bin/sh shebang (the only
+# interpreter guaranteed to exist) and pick the argv[0]-preserving path at
+# runtime instead:
+#   1. our own shell, if it happens to support -a (bash, ksh, zsh as sh);
+#   2. otherwise bash, which is not guaranteed but is present on every glibc
+#      desktop distro.  `bash -c 'script' name args...` sets $0 to name, so
+#      the inner exec sees our argv[0] as $0 and $REAL "$@" as "$@";
+#   3. otherwise a plain exec, which still runs the right program — only
+#      argv[0] is then the companion's dotted path.
+if (exec -a _probe true) 2>/dev/null; then
+  exec -a "$0" "$REAL" "$@"
+elif command -v bash >/dev/null 2>&1; then
+  exec bash -c 'exec -a "$0" "$@"' "$0" "$REAL" "$@"
 fi
+exec "$REAL" "$@"
+LAUNCHER_BODY
 
-# Fallback: find the system dynamic linker and use it to launch the binary.
-# When launched this way, /proc/self/exe points to the interpreter (ld-linux)
-# instead of the actual binary, breaking QCoreApplication::applicationDirPath()
-# and anything else that reads /proc/self/exe.  Load a tiny LD_PRELOAD shim
-# that intercepts readlink("/proc/self/exe") and returns the real binary path.
-PROCSELF_SHIM="$BUNDLE_LIB/libprocself_fix.so"
-if [ -f "$PROCSELF_SHIM" ]; then
-  export LD_PRELOAD="$PROCSELF_SHIM${LD_PRELOAD:+:$LD_PRELOAD}"
-fi
-for p in \
-    "/lib64/$INTERP_NAME" \
-    "/lib/$INTERP_NAME" \
-    "/lib/x86_64-linux-gnu/$INTERP_NAME" \
-    "/lib/aarch64-linux-gnu/$INTERP_NAME" \
-    "/usr/lib64/$INTERP_NAME" \
-    "/usr/lib/$INTERP_NAME"; do
-  if [ -x "$p" ]; then
-    exec "$p" "$REAL" "$@"
-  fi
-done
-echo "Error: cannot find system dynamic linker ($INTERP_NAME)" >&2
-exit 1
-WRAPPER_EOF
-
-    chmod +x "$elf"
-    echo "  $base -> .$base.elf (wrapper)"
+    chmod +x "$f"
+    echo "  $base -> .$base.elf (launcher: XKB_CONFIG_ROOT)"
   done
 fi
 
