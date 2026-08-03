@@ -101,10 +101,19 @@ On Linux, phase 3 also does two things worth knowing about as output contract:
   your environment.)
 
 Some bundles additionally get a **launcher** at `bin/<name>`, with the real
-binary beside it as `bin/.<name>.elf`. It is emitted only when the bundle needs
-an environment variable that its libraries cannot derive on their own —
+binary beside it as `bin/.<name>.elf`. It is emitted only when `guiApp` is set
+(the default) *and* the bundle needs an environment variable that its libraries
+cannot derive on their own —
 `XKB_CONFIG_ROOT` (libxkbcommon has its config root baked to a store path) or
 `QT_QPA_PLATFORMTHEME` (the portal file-dialog theme must be chosen by name).
 It is a plain `exec` wrapper, not an `ld.so` trampoline: `/proc/self/exe` is the
 real binary and `argv[0]` is the launcher, so both identities are honest. If you
 copy a bundle's `bin/` by hand, copy the dotfiles too.
+
+Pass **`guiApp = false`** for a bundle that never puts anything on screen — a
+headless CLI, a daemon — and its `bin/` entries stay plain binaries with no
+companion. Leave it alone for anything that renders, *including a host process
+that only loads UI plugins at runtime*: the bundler cannot detect that case (the
+app's `DT_NEEDED` never names `libxkbcommon`, since the platform plugin
+`dlopen`s it), and getting it wrong that way is a segfault rather than a
+cosmetic wart.

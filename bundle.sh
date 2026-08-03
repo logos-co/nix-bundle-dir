@@ -1078,7 +1078,11 @@ if [ "$xkb_detected" = "1" ] && [ -d "$out/share/X11/xkb" ]; then _need_xkb=1; f
 _need_theme=0
 if [ -f "$out/lib/qt/plugins/platformthemes/libqxdgdesktopportal.so" ]; then _need_theme=1; fi
 
-if [ "$IS_DARWIN" != "1" ] && [ -d "$out/bin" ] \
+# GUI_APP is the caller's declaration (mkBundle's `guiApp`). Both variables
+# above only matter once a Qt GUI platform plugin is loaded, and nothing the
+# bundler can measure tells it whether that will happen — so a bundle that says
+# it puts nothing on screen gets plain binaries and no companion ELF.
+if [ "$IS_DARWIN" != "1" ] && [ -d "$out/bin" ] && [ "${GUI_APP:-1}" = "1" ] \
      && { [ "$_need_xkb" = "1" ] || [ "$_need_theme" = "1" ]; }; then
   echo "Phase 5b: Generating environment launchers..."
 

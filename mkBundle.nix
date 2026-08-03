@@ -8,6 +8,25 @@
 , extraClosurePaths ? []
 , useDefaultSystemLibs ? true
 , warnOnBinaryData ? false
+# Does anything in this bundle put a GUI on screen?
+#
+# It decides whether bin/ entries get an environment launcher. Two bundled
+# libraries need a variable set that they cannot derive from their own
+# location: libxkbcommon has its config root baked to a store path (without
+# XKB_CONFIG_ROOT a Qt app segfaults in keymap dispatch on Wayland — measured,
+# not theoretical), and the xdg-desktop-portal file-dialog theme has to be
+# chosen by name. Both only matter once a Qt GUI platform plugin is loaded.
+#
+# It is a declaration rather than something the bundler detects, because
+# detection cannot work: the app's own DT_NEEDED never mentions libxkbcommon
+# (the platform plugin dlopens it), and a host process like `ui-host` shows no
+# GUI symbol at all yet renders QML through plugins it loads at runtime.
+# Guessing wrong in that direction is a segfault, so the caller — who knows
+# what it built — says.
+#
+# Default true is the safe direction: a needless launcher costs a hidden
+# companion ELF, a missing one costs a crash.
+, guiApp ? true
 }:
 
 let
@@ -116,6 +135,7 @@ pkgs.stdenv.mkDerivation {
   HOST_LIBS = builtins.concatStringsSep "\n" hostLibs;
   EXTRA_DIRS = builtins.concatStringsSep "\n" extraDirs;
   WARN_ON_BINARY_DATA = if warnOnBinaryData then "1" else "0";
+  GUI_APP = if guiApp then "1" else "0";
 
   buildPhase = ''
     bash ${./bundle.sh}
