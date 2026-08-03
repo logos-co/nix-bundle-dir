@@ -944,7 +944,7 @@ else
     # can no longer LD_LIBRARY_PATH their way into overriding a bundled
     # library — which is precisely the point of a self-contained bundle.
     patchelf --force-rpath --set-rpath "\$ORIGIN:\$ORIGIN/$rel_to_lib" "$f" 2>/dev/null || \
-      echo "  Warning: patchelf --set-rpath failed for $f"
+      echo "  Warning: patchelf --force-rpath --set-rpath failed for $f"
 
     # Rewrite absolute /nix/store NEEDED entries to bare library names.
     # Nix can embed full store paths in DT_NEEDED (e.g. /nix/store/.../libfoo.so).
@@ -1172,8 +1172,9 @@ SELF_DIR="$(_find_self_dir "$0")"
 
 # xkeyboard-config data path — libxkbcommon was built with a hardcoded
 # /nix/store path that won't exist at runtime; without this, Qt Wayland's
-# keymap dispatch segfaults on a NULL xkb context.  This is the only reason
-# this launcher exists.
+# keymap dispatch segfaults on a NULL xkb context.  This is one of the two
+# reasons a launcher is emitted at all; the portal theme below is the other,
+# and either alone is enough, so neither can assume the other applies.
 if [ -d "$SELF_DIR/../share/X11/xkb" ]; then
   export XKB_CONFIG_ROOT="$SELF_DIR/../share/X11/xkb"
 fi
@@ -1238,7 +1239,12 @@ exec "$REAL" "$@"
 LAUNCHER_BODY
 
     chmod +x "$f"
-    echo "  $base -> .$base.elf (launcher: XKB_CONFIG_ROOT)"
+    # Name what this launcher is actually for: with independent gates it can
+    # be either variable, or both.
+    _why=""
+    [ "$_need_xkb" = "1" ]   && _why="XKB_CONFIG_ROOT"
+    [ "$_need_theme" = "1" ] && _why="${_why:+$_why, }QT_QPA_PLATFORMTHEME"
+    echo "  $base -> .$base.elf (launcher: $_why)"
   done
 fi
 

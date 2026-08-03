@@ -106,9 +106,12 @@ binary beside it as `bin/.<name>.elf`. It is emitted only when `guiApp` is set
 cannot derive on their own —
 `XKB_CONFIG_ROOT` (libxkbcommon has its config root baked to a store path) or
 `QT_QPA_PLATFORMTHEME` (the portal file-dialog theme must be chosen by name).
-It is a plain `exec` wrapper, not an `ld.so` trampoline: `/proc/self/exe` is the
-real binary and `argv[0]` is the launcher, so both identities are honest. If you
-copy a bundle's `bin/` by hand, copy the dotfiles too.
+It is a plain `exec` wrapper, not an `ld.so` trampoline, so `/proc/self/exe` is
+the real binary rather than the loader. `argv[0]` is the launcher **where the
+host shell can preserve it** — the wrapper uses `exec -a` if its own `/bin/sh`
+supports it, else bridges through `bash`; on a host with neither (no `exec -a`,
+no `bash`) it falls back to a plain `exec` and `argv[0]` becomes the real ELF
+path. If you copy a bundle's `bin/` by hand, copy the dotfiles too.
 
 Pass **`guiApp = false`** for a bundle that never puts anything on screen — a
 headless CLI, a daemon — and its `bin/` entries stay plain binaries with no
