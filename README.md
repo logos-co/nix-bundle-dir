@@ -85,3 +85,26 @@ The bundler is a Nix derivation that runs a [six-phase shell script](bundle.sh):
 4. **Re-sign** Mach-O binaries (macOS only — required after any modification)
 5. **Rewrite shebangs** from `/nix/store/...` to `#!/usr/bin/env ...`
 6. **Verify** portability by copying the output to a temp directory (outside `/nix/store`) and checking that all references are portable
+
+On Linux, phase 3 also does two things worth knowing about as output contract:
+
+- It sets each ELF's interpreter to the path its **psABI mandates**
+  (`/lib64/ld-linux-x86-64.so.2` on x86-64, `/lib/ld-linux-aarch64.so.1` on
+  aarch64). Every glibc distro provides those exact paths, so the binaries run
+  directly — there is no launcher indirection through `ld.so`. Note the two
+  prefixes deliberately differ; `/lib64` for both would break arm64.
+- It writes **`DT_RPATH` rather than `DT_RUNPATH`**, so bundled libraries take
+  priority over a stale `LD_LIBRARY_PATH` instead of losing to it. A consequence
+  worth stating: you can no longer override a *bundled* library via
+  `LD_LIBRARY_PATH`. (`nixGL` still works — GPU libraries are on the exclude
+  list, so they are absent from `$ORIGIN/../lib` and the search falls through to
+  your environment.)
+
+Some bundles additionally get a **launcher** at `bin/<name>`, with the real
+binary beside it as `bin/.<name>.elf`. It is emitted only when the bundle needs
+an environment variable that its libraries cannot derive on their own —
+`XKB_CONFIG_ROOT` (libxkbcommon has its config root baked to a store path) or
+`QT_QPA_PLATFORMTHEME` (the portal file-dialog theme must be chosen by name).
+It is a plain `exec` wrapper, not an `ld.so` trampoline: `/proc/self/exe` is the
+real binary and `argv[0]` is the launcher, so both identities are honest. If you
+copy a bundle's `bin/` by hand, copy the dotfiles too.
