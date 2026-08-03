@@ -42,6 +42,25 @@
               hostLibs = drv.hostLibs or [];
               warnOnBinaryData = true;
             };
+          # A Qt program that never puts anything on screen — a headless CLI or
+          # daemon. Same bundling as qtApp, but its bin/ entries stay plain
+          # binaries: with no GUI there is no platform plugin, so nothing needs
+          # XKB_CONFIG_ROOT or the portal theme, and there is no reason to pay
+          # for a launcher and a hidden companion ELF.
+          #
+          # Use qtApp instead for anything that renders, INCLUDING a host
+          # process that only loads UI plugins at runtime — see `guiApp` in
+          # mkBundle.nix for why that case cannot be detected.
+          qtCliApp = drv:
+            mkBundle {
+              inherit drv;
+              name = drv.pname or drv.name or "bundle";
+              extraDirs = drv.extraDirs or [];
+              extraClosurePaths = drv.extraClosurePaths or [];
+              hostLibs = drv.hostLibs or [];
+              warnOnBinaryData = true;
+              guiApp = false;
+            };
           qtPlugin = drv:
             mkBundle {
               inherit drv;
