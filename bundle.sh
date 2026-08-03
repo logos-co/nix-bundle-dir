@@ -69,9 +69,13 @@ if [ -d "$DRV_PATH/bin" ]; then
   # Without the second glob, re-bundling an already-bundled tree copies the
   # launchers and silently drops the binaries they exec — leaving a bin/ whose
   # entries fail with a bare ENOENT.
-  for f in "$DRV_PATH"/bin/* "$DRV_PATH"/bin/.*; do
+  #
+  # Match ONLY our own companion convention, not every dotfile: nixpkgs' Qt
+  # hooks leave their own `.<name>-wrapped` C wrappers next to the binaries,
+  # and those are exactly what Phase 1b below exists to strip out. Sweeping
+  # them in here would ship a wrapper full of /nix/store paths.
+  for f in "$DRV_PATH"/bin/* "$DRV_PATH"/bin/.*.elf; do
     [ -e "$f" ] || continue
-    case "$(basename "$f")" in .|..) continue ;; esac
     cp -aL "$f" "$out/bin/"
   done
   chmod -R u+w "$out/bin" 2>/dev/null || true
