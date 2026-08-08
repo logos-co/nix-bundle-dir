@@ -593,6 +593,7 @@ pe_dir_index() {
 # import name -> space-separated list of importers that wanted it
 declare -A pe_unresolved
 pe_staged_total=0
+pe_mirrored_total=0
 
 # Walk the import tables of every root, stage what is missing into bin/, and
 # REPEAT until a round adds nothing.
@@ -604,7 +605,7 @@ pe_staged_total=0
 # Qt6QmlCore is reachable only through a LoadLibrary'd QML plugin.
 pe_sweep() {
   local label="$1"
-  local round=0 added root rootdir imp key src dest roots_seen
+  local round=0 added root rootdir imp key src dest roots_seen beside_name
   echo "  DLL closure sweep ($label):"
   pe_dir_index "$out/bin"
   while :; do
@@ -619,10 +620,34 @@ pe_sweep() {
         [ -n "$imp" ] || continue
         is_windows_system_dll "$imp" && continue
         key="${imp,,}"
-        # Satisfied if it sits beside the importer, or in bin/ — those are the
-        # two directories the loader actually searches for this bundle.
-        [ -n "${pe_dir_have["$rootdir|$key"]:-}" ] && continue
+        # bin/ first: that is the executable's own directory, which Windows
+        # always searches, for every module in the process.
         [ -n "${pe_dir_have["$out/bin|$key"]:-}" ] && continue
+        # "Sits beside the importer" satisfies the CHECK, but it is not a
+        # guarantee the bundler can make: the loader only searches the
+        # importing MODULE's directory when that module was loaded with
+        # LOAD_WITH_ALTERED_SEARCH_PATH (or AddDllDirectory), which is a
+        # property of the LoadLibrary call site, not of the bundle, and is not
+        # inherited by a dependency-of-a-dependency.  Measured on the real
+        # bundle: 12 DLLs were satisfied ONLY by this rule.
+        #
+        # So mirror a copy into bin/ as well.  Strictly additive (~12 files,
+        # a few MB), it never shadows anything — the bin/ test above already
+        # returned — and it converts an assumption about a loader flag into a
+        # file that is simply there.
+        if [ -n "${pe_dir_have["$rootdir|$key"]:-}" ]; then
+          if [ "$rootdir" != "$out/bin" ]; then
+            beside_name="${pe_dir_have["$rootdir|$key"]}"
+            cp -L "$rootdir/$beside_name" "$out/bin/$beside_name"
+            chmod u+w "$out/bin/$beside_name" 2>/dev/null || true
+            pe_dir_have["$out/bin|$key"]="$beside_name"
+            pe_mirrored_total=$((pe_mirrored_total + 1))
+            added=$((added + 1))
+            echo "    round $round  ~ $beside_name  mirrored into bin/ from" \
+                 "${rootdir#$out/} (was reachable only by the beside-the-importer rule)"
+          fi
+          continue
+        fi
         src="${pe_dll_index[$key]:-}"
         if [ -z "$src" ]; then
           pe_unresolved["$imp"]="${pe_unresolved["$imp"]:-}${root#$out/} "
@@ -659,7 +684,7 @@ pe_sweep() {
   # pe_reader_control has already ruled out the second, before any sweep ran,
   # so a zero here is a fact about the input.  Say what happened either way.
   echo "  DLL closure sweep ($label) converged after $round round(s);" \
-       "$pe_staged_total DLL(s) staged so far"
+       "$pe_staged_total DLL(s) staged, $pe_mirrored_total mirrored into bin/, so far"
 }
 
 # Is this closure directory a Qt plugin/QML tree for the TARGET we are
