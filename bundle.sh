@@ -254,8 +254,18 @@ if [ "$IS_WINDOWS" = "1" ]; then
   if [ -d "$DRV_PATH/bin" ]; then
     src_bin_entries="$(find "$DRV_PATH/bin" -maxdepth 1 -mindepth 1 | wc -l)"
   fi
-  out_bin_entries="$(find "$out/bin" -maxdepth 1 -mindepth 1 | wc -l)"
-  out_bin_links="$(find "$out/bin" -maxdepth 1 -mindepth 1 -type l | wc -l)"
+  # Guarded on BOTH sides. The source side above already was; this one was not,
+  # and a Windows output with no bin/ at all is a shape this workspace actually
+  # produces -- a Logos module is `lib/<name>_plugin.dll` and nothing else, and
+  # nix-bundle-lgx feeds exactly those through here. Unguarded it printed a bare
+  # `find: '.../bin': No such file or directory` and died with no ERROR line and
+  # no phase name, on a branch whose stated standard is to fail loudly.
+  out_bin_entries=0
+  out_bin_links=0
+  if [ -d "$out/bin" ]; then
+    out_bin_entries="$(find "$out/bin" -maxdepth 1 -mindepth 1 | wc -l)"
+    out_bin_links="$(find "$out/bin" -maxdepth 1 -mindepth 1 -type l | wc -l)"
+  fi
   echo "  bin/ entry count: source $src_bin_entries -> bundle $out_bin_entries" \
        "($out_bin_links symlink(s) remaining)"
   if [ "$out_bin_entries" -lt "$src_bin_entries" ]; then
@@ -565,6 +575,16 @@ pe_dir_index() {
   [ -d "$d" ] || return 0
   for e in "$d"/*; do
     [ -e "$e" ] || continue
+    # Index only ACTUAL PEs. This used to record every directory entry
+    # regardless of content, and the index is what decides whether an import is
+    # satisfied -- so a plain text file named libcurl-4.dll "satisfied" the
+    # import and was even mirrored into bin/, while the sweep reported a
+    # complete closure. Reproduced with a matched control: replacing one real
+    # DLL with `printf 'PLACEHOLDER - not a PE'` changed nothing the script
+    # said, and the loader would then fail at 0xC0000135 against a bundle this
+    # very script had just called verified. Name and existence are not
+    # satisfaction; being loadable is.
+    pe_is_pe "$e" || continue
     key="$(basename "$e")"
     pe_dir_have["$d|${key,,}"]="$key"
   done
@@ -621,6 +641,13 @@ pe_sweep() {
             beside_name="${pe_dir_have["$rootdir|$key"]}"
             cp -L "$rootdir/$beside_name" "$out/bin/$beside_name"
             chmod u+w "$out/bin/$beside_name" 2>/dev/null || true
+            # Post-condition, as the staging path below already has. This
+            # branch used to copy and record with no check at all, so a failed
+            # or truncated copy still marked the import satisfied.
+            if [ -L "$out/bin/$beside_name" ] || [ ! -s "$out/bin/$beside_name" ]; then
+              echo "  ERROR: mirroring $beside_name from ${rootdir#$out/} produced no usable file" >&2
+              exit 1
+            fi
             pe_dir_have["$out/bin|$key"]="$beside_name"
             pe_mirrored_total=$((pe_mirrored_total + 1))
             added=$((added + 1))
@@ -2261,7 +2288,14 @@ if [ "$IS_WINDOWS" = "1" ]; then
       win_lost_names=$((win_lost_names + 1))
     done < <(find "$DRV_PATH/bin" -maxdepth 1 -mindepth 1 -printf '%f\n' | sort)
   fi
-  win_out_bin="$(find "$out/bin" -maxdepth 1 -mindepth 1 | wc -l)"
+  # `[ -d ]` guard: a Windows output need not have a bin/ at all. A Logos module
+  # is `lib/<name>_plugin.dll` and nothing else, and nix-bundle-lgx feeds exactly
+  # those derivations through here -- so this is a shape the workspace produces,
+  # not a hypothetical. Unguarded it emitted a bare
+  # `find: '.../bin': No such file or directory` with no ERROR line and no
+  # phase name, on a branch whose stated standard is to fail loudly.
+  win_out_bin=0
+  [ -d "$out/bin" ] && win_out_bin="$(find "$out/bin" -maxdepth 1 -mindepth 1 | wc -l)"
   echo "  bin/ entries: $win_src_bin in the source derivation, all present by" \
        "name in the bundle's $win_out_bin ($win_lost_names missing)"
   if [ "$win_lost_names" -gt 0 ]; then
@@ -2448,15 +2482,37 @@ find "$test_dir" -type f | while IFS= read -r f; do
   rel="${f#$test_dir/}"
   nix_refs="$(strings "$f" 2>/dev/null | grep -c '/nix/' || true)"
   if [ "$nix_refs" -gt 0 ]; then
-    if [ "${WARN_ON_BINARY_DATA:-0}" = "1" ]; then
+    # On a PE these are never fatal, whatever warnOnBinaryData says.
+    #
+    # The scan exists to answer "will this run outside /nix?". For ELF and
+    # Mach-O an embedded store path can BE the answer — it is how the loader
+    # finds libraries. A PE has no rpath and no interpreter: its imports are
+    # base names resolved against the search path, so a /nix/ string in one is
+    # inert residue (gcc include paths in debug metadata, OPENSSLDIR, the
+    # occasional __FILE__), never a load-time reference.
+    #
+    # Treating them as errors made the DEFAULT configuration unbuildable on
+    # Windows, and nothing caught it because every Windows run so far happened
+    # to pass warnOnBinaryData = true. mkBundle's own default is false, and
+    # `bundlers.default` passes false. Demonstrated on a fixture pair identical
+    # but for the flag: 10 "non-portable" hits in stock mingw Qt and OpenSSL —
+    # Qt6Core.dll alone carries 28 x86_64-w64-mingw32-gcc-15.2.0 include paths.
+    if [ "$IS_WINDOWS" = "1" ]; then
+      echo "  NOTE: $rel contains $nix_refs embedded /nix/ string(s) (inert on PE: no rpath, imports are base names)"
+    elif [ "${WARN_ON_BINARY_DATA:-0}" = "1" ]; then
       echo "  WARNING: $rel contains $nix_refs embedded /nix/ reference(s) in binary data"
     else
       echo "  ERROR: $rel contains $nix_refs embedded /nix/ reference(s) in binary data"
       echo "1" >> "$test_dir/.errors"
     fi
-    strings "$f" 2>/dev/null | grep '/nix/' | sort -u | while IFS= read -r ref; do
-      echo "    $ref"
-    done
+    # The listing is a diagnostic for a real portability problem; on PE the
+    # note above already says the strings are inert, so do not dump dozens of
+    # gcc include paths per DLL on every Windows build.
+    if [ "$IS_WINDOWS" != "1" ]; then
+      strings "$f" 2>/dev/null | grep '/nix/' | sort -u | while IFS= read -r ref; do
+        echo "    $ref"
+      done
+    fi
   fi
 done
 
