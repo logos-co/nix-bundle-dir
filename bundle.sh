@@ -143,43 +143,115 @@ for dir in "${extra_dirs[@]+"${extra_dirs[@]}"}"; do
 done
 
 # ===========================================================================
-# Phase 1c — Decide whether this bundle is Windows/PE
+# Phase 1c — What TARGET is this bundle for?
 # ===========================================================================
-# This cannot be answered from `pkgs` at eval time.  mkBundle.nix's `isDarwin`
-# reads the BUILD platform, and the bundler is deliberately selected by the
-# build system (it *runs* on the builder — see logos-basecamp's
-# `dirBundler = nix-bundle-dir.bundlers.${buildSystem}.qtApp`), so a
-# cross-compiled Windows target is invisible to Nix on this side.  Measure the
-# artefacts instead, after Phase 1 has turned win-dll-link.sh's relative store
-# symlinks into real files.
+# bundle.sh does not answer this.  mkBundle.nix does, by reading it off the
+# derivation being bundled — `drv.stdenv.hostPlatform.isWindows` — and passing
+# it in as IS_WINDOWS.  See mkBundle.nix for why `drv.stdenv` is the right
+# source and `pkgs.stdenv` (which `isDarwin` reads) is not.
 #
-# The discriminator is the bundle's own EXECUTABLES, not "a .dll exists
-# somewhere": a Linux bundle that ships a DLL as data must never flip this
-# flag, because that would silently disable Phase 3 and leave every ELF
-# pointing into /nix/store.  So: at least one PE executable in bin/, and no
-# ELF or Mach-O binary in bin/ at all.
+# This used to be an artefact heuristic here, and heuristics have no floor:
+# the one that lived at this spot flipped a Linux bundle to the PE path merely
+# because its bin/ shipped a .exe, and — the other direction, which is worse —
+# left IS_WINDOWS=0 for a Windows derivation whose bin/ held only DLLs, so the
+# whole Qt staging was skipped and the build exited 0 with an empty lib/.
+#
+# Artefacts are still measured below, but only to CONTRADICT Nix, never to
+# decide.  The one exception is IS_WINDOWS=unknown, which means the caller
+# passed a `drv` that is not an mkDerivation at all (a bare `builtins.storePath`
+# or a hand-rolled `derivation`) and there is nothing authoritative to read.
 #
 # `file -bL`, not `file -b`: on an unresolved symlink `file -b` answers
 # "symbolic link to ..." and never "PE32+", which reads as a confident zero.
-IS_WINDOWS=0
+IS_WINDOWS="${IS_WINDOWS:-unknown}"
+
+# Count bin/'s formats once.  Cheap (bin/ is small), and both the unknown-target
+# fallback and the contradiction checks want it.
 pe_exe_count=0
+pe_dll_count=0
 unix_bin_count=0
 if [ -d "$out/bin" ]; then
   for f in "$out"/bin/*; do
     [ -f "$f" ] || continue
     ft="$(file -bL "$f" 2>/dev/null)" || continue
     case "$ft" in
-      *PE32*"(DLL)"*)   ;;
+      *PE32*"(DLL)"*)   pe_dll_count=$((pe_dll_count + 1)) ;;
       *PE32*)           pe_exe_count=$((pe_exe_count + 1)) ;;
       *Mach-O*|*ELF*)   unix_bin_count=$((unix_bin_count + 1)) ;;
     esac
   done
 fi
-if [ "$pe_exe_count" -gt 0 ] && [ "$unix_bin_count" -eq 0 ]; then
-  IS_WINDOWS=1
+
+# Whole-tree format census.  Only ever called on a path where the answer
+# changes what happens, because it is O(files) and the Unix path must not pay
+# for it: see the two call sites below.
+tree_pe_count=0
+tree_unix_count=0
+tree_census() {
+  tree_pe_count=0
+  tree_unix_count=0
+  local f ft
+  while IFS= read -r f; do
+    ft="$(file -bL "$f" 2>/dev/null)" || continue
+    case "$ft" in
+      *PE32*)         tree_pe_count=$((tree_pe_count + 1)) ;;
+      *Mach-O*|*ELF*) tree_unix_count=$((tree_unix_count + 1)) ;;
+    esac
+  done < <(find "$out" -type f 2>/dev/null)
+  return 0
+}
+
+if [ "$IS_WINDOWS" = "unknown" ]; then
+  # No `stdenv` on the drv, so there is nothing to be authoritative about and
+  # the artefacts are all there is.  Say so loudly — a silent guess here is the
+  # shape of the bug this branch exists to remove — and refuse to guess when
+  # the tree genuinely contains both formats.
+  tree_census
+  echo "Phase 1c: the bundled derivation carries no stdenv, so the target could" \
+       "not be read from Nix; falling back to a format census of the output:" \
+       "$tree_pe_count PE file(s), $tree_unix_count ELF/Mach-O file(s)"
+  if [ "$tree_pe_count" -gt 0 ] && [ "$tree_unix_count" -gt 0 ]; then
+    echo "  ERROR: this output contains BOTH PE and ELF/Mach-O binaries, so the" >&2
+    echo "  census cannot tell a Windows bundle from a Unix bundle that ships a" >&2
+    echo "  PE as data.  Pass the target explicitly:" >&2
+    echo "      mkBundle { drv = ...; windowsTarget = true;  }   # or false" >&2
+    exit 1
+  fi
+  if [ "$tree_pe_count" -gt 0 ]; then IS_WINDOWS=1; else IS_WINDOWS=0; fi
+  echo "  -> IS_WINDOWS=$IS_WINDOWS"
+elif [ "$IS_WINDOWS" = "1" ]; then
+  echo "Phase 1c: target is Windows/PE (from the bundled derivation's stdenv)"
+  # Nix says Windows and the output has no PE anywhere.  Do not proceed: every
+  # later "0 unresolved imports" would be a measurement of nothing.
+  tree_census
+  if [ "$tree_pe_count" -eq 0 ]; then
+    echo "  ERROR: Nix says this derivation targets Windows, but its output" >&2
+    echo "  contains no PE file at all ($tree_unix_count ELF/Mach-O file(s) found)." >&2
+    echo "  Something upstream produced host binaries for a cross target; a" >&2
+    echo "  bundle built from this would be checked against nothing." >&2
+    exit 1
+  fi
+  echo "  Output census: $tree_pe_count PE file(s), $tree_unix_count ELF/Mach-O file(s)"
+else
+  # Unix target.  Nix is authoritative and a Linux package that ships a .exe as
+  # data is entirely legitimate, so this can only ever be a warning — a hard
+  # error here would be a new build breakage on valid input.  The narrow shape
+  # worth naming is a tree with PEs and NO native binaries at all, which is
+  # what a mis-wired cross build looks like.
+  if [ "$pe_exe_count" -gt 0 ] || [ "$pe_dll_count" -gt 0 ]; then
+    if [ "$unix_bin_count" -eq 0 ]; then
+      tree_census
+      if [ "$tree_unix_count" -eq 0 ]; then
+        echo "  WARNING: Nix says this derivation does NOT target Windows, yet the" >&2
+        echo "  output contains $tree_pe_count PE file(s) and no ELF/Mach-O binary" >&2
+        echo "  at all.  Proceeding on the Unix path, as Nix is authoritative." >&2
+        find "$out" -type f 2>/dev/null | while IFS= read -r f; do
+          case "$(file -bL "$f" 2>/dev/null)" in *PE32*) echo "    ${f#"$out"/}" >&2 ;; esac
+        done
+      fi
+    fi
+  fi
 fi
-echo "Phase 1c: format probe — bin/ holds $pe_exe_count PE executable(s) and" \
-     "$unix_bin_count ELF/Mach-O binary/ies -> IS_WINDOWS=$IS_WINDOWS"
 
 # Where the Qt plugin and QML trees get staged inside the bundle.  "qt"
 # everywhere the bundler already worked; "qt-6" on Windows, which is the layout
@@ -266,30 +338,172 @@ is_windows_system_dll() {
   return 1
 }
 
-# Read a PE import table.  Ordinary binutils objdump handles a MinGW PE fine;
-# no cross toolchain is needed.  Every consumer of this treats an EMPTY result
-# as suspicious, because "no imports" and "objdump could not read the file"
-# look identical here.
-pe_imports() {
-  objdump -p "$1" 2>/dev/null | sed -n 's/^[[:space:]]*DLL Name:[[:space:]]*//p'
+# --- is this file a PE? -----------------------------------------------------
+# Memoised, because the fixpoint sweep re-walks the whole output once per round
+# and a Basecamp bundle is ~2 GB.  A file's contents never change once staged,
+# so one answer per path is enough for the entire build.
+#
+# The "MZ" prefilter is not micro-optimisation: without it this is one `file`
+# process per file per round, which on an 8-round sweep over ~20k files is
+# ~160k process spawns.  `read -N 2` is a bash builtin and spawns nothing.
+# Every PE begins with "MZ" (IMAGE_DOS_HEADER.e_magic), so a non-MZ file cannot
+# be a PE and the prefilter cannot produce a false negative.
+declare -A pe_filetype_cache
+pe_is_pe() {
+  local f="$1" ft magic
+  ft="${pe_filetype_cache["$f"]:-}"
+  if [ -z "$ft" ]; then
+    magic=""
+    IFS= read -r -N 2 magic < "$f" 2>/dev/null || true
+    if [ "$magic" = "MZ" ]; then
+      # `file -bL`, not `file -b`: on a symlink `file -b` answers "symbolic
+      # link to ..." and never "PE32+", which reads as a confident "not a PE".
+      ft="$(file -bL "$f" 2>/dev/null)" || ft="?"
+      [ -n "$ft" ] || ft="?"
+    else
+      ft="not-MZ"
+    fi
+    pe_filetype_cache["$f"]="$ft"
+  fi
+  [[ "$ft" == *PE32* ]]
 }
 
-# name (lowercased) -> providing file, for every .dll in the closure.
+# --- every PE in the bundle -------------------------------------------------
+# ONE enumeration, used by BOTH the fixpoint sweep and Phase 6's validator.
+#
+# v1 had two independent ones and they drifted, which is a build failure on
+# valid input rather than a style complaint: the sweep walked bin/ at maxdepth
+# 1, *.dll under the staged Qt tree, and *.dll/*.exe under declared extraDirs,
+# while the verifier walked `find "$out" -type f`.  A PE anywhere else — under
+# $out/lib outside the Qt stage (which Phase 1 populates and the app-QML
+# symlink pass at the end of Phase 2b explicitly expects), under a bin/
+# subdirectory, under libexec/ or share/, or with a non-.dll extension such as
+# .pyd/.ocx/.drv/.cpl — was never swept but always checked, so the build died
+# on a dependency that was in the closure all along and blamed the closure for
+# it.  Demonstrated twice, independently, on two different relocations.
+#
+# Selection is by CONTENT, not by suffix, for the same reason.
+#
+# `find -type f` does not descend directory symlinks, and the app-QML pass
+# creates exactly those under the staged QML tree — but their targets are real
+# files under $out/lib, which this walk reaches by their real path, so nothing
+# is lost.  Sorted so the walk order is deterministic.
+pe_files() {
+  local f
+  while IFS= read -r f; do
+    pe_is_pe "$f" && printf '%s\n' "$f"
+  done < <(find "$out" -type f 2>/dev/null | sort)
+  # Explicit, and not cosmetic: without it the function's status is that of the
+  # last `pe_is_pe`, so a tree whose last file is not a PE returns 1 — and under
+  # `set -e` a caller that redirects (`pe_files > "$list"`) then dies with no
+  # message at all.  That is a silent exit 1 in the middle of the success path.
+  return 0
+}
+
+# --- the PE import-table reader ---------------------------------------------
+# PE_OBJDUMP comes from the TARGET's own bintools (see mkBundle.nix).  The
+# fallback to bare `objdump` exists for `windowsTarget = true` on a derivation
+# with no cross toolchain to borrow from; it is NOT a preference.  Either way
+# pe_reader_control below proves the chosen reader actually reads PEs before
+# any zero it returns is believed.
+pe_objdump=""
+pe_resolve_objdump() {
+  local c
+  for c in "${PE_OBJDUMP:-}" objdump; do
+    [ -n "$c" ] || continue
+    if command -v "$c" >/dev/null 2>&1; then
+      pe_objdump="$c"
+      return 0
+    fi
+  done
+  echo "  ERROR: no PE import-table reader is available.  PE_OBJDUMP was" >&2
+  echo "  '${PE_OBJDUMP:-}' and no 'objdump' is on PATH; a Windows bundle" >&2
+  echo "  cannot be verified without one." >&2
+  exit 1
+}
+
+# Memoised for the same reason pe_is_pe is: the sweep asks the same question of
+# the same file once per round.
+declare -A pe_imports_cache
+pe_imports() {
+  local f="$1"
+  if [ -z "${pe_imports_cache["$f"]+x}" ]; then
+    pe_imports_cache["$f"]="$("$pe_objdump" -p "$f" 2>/dev/null \
+      | sed -n 's/^[[:space:]]*DLL Name:[[:space:]]*//p')"
+  fi
+  printf '%s\n' "${pe_imports_cache["$f"]}"
+}
+
+# --- known-positive control for the reader ----------------------------------
+# Run BEFORE the first sweep, not in Phase 6, because every sweep decision
+# downstream depends on it.  A broken reader and a complete bundle are the same
+# observation — an empty import list — and the only thing that separates them is
+# whether SOME PE in the bundle yields imports, since a PE that imports nothing
+# at all cannot even call the C runtime.
+#
+# Any PE will do, including a DLL.  v1 required a PE *executable* and therefore
+# exited 1 on a Windows output whose bin/ holds only DLLs.
+#
+# The failure this guards against is not hypothetical in the general case:
+# x86_64-linux binutils happens to support pei-x86-64, but an objdump built for
+# a builder without a PE target reports zero imports for every file and exits 0.
+pe_reader_control() {
+  local f n probed=0 list
+  # Via a temp file rather than a process substitution: this loop returns as
+  # soon as it finds a positive, which would leave pe_files writing into a
+  # closed pipe and print a spurious "printf: write error: Broken pipe" from
+  # inside the success path.
+  list="$(mktemp)"
+  pe_files > "$list"
+  while IFS= read -r f; do
+    probed=$((probed + 1))
+    n="$(pe_imports "$f" | grep -c . || true)"
+    if [ "$n" -gt 0 ]; then
+      echo "  Import-reader control ($pe_objdump): ${f#"$out"/} declares" \
+           "$n import(s) — the reader works"
+      rm -f "$list"
+      return 0
+    fi
+  done < "$list"
+  rm -f "$list"
+  echo "  ERROR: the import reader ($pe_objdump) returned ZERO imports for all" >&2
+  echo "  $probed PE file(s) in this bundle.  A PE that imports nothing cannot" >&2
+  echo "  call the C runtime, so this is a broken reader, not a clean bundle —" >&2
+  echo "  and every later 'all imports resolve' would be a measurement of" >&2
+  echo "  nothing.  Check that PE_OBJDUMP targets pei-x86-64." >&2
+  exit 1
+}
+
+# name (lowercased) -> providing file, for every loadable PE module in the
+# closure.
 declare -A pe_dll_index
 declare -A pe_dll_prio
+declare -A pe_dll_alts
 
 pe_build_dll_index() {
   local list sp p parent key prio total
-  if ! command -v objdump >/dev/null 2>&1; then
-    echo "  ERROR: objdump is not on PATH; a PE bundle cannot be built without" \
-         "an import-table reader" >&2
-    exit 1
-  fi
   list="$(mktemp)"
+  # No -maxdepth.  v1 capped it at 6, which on the real closure hid 29 of 402
+  # DLLs (all QML style plugins nested 7-8 deep); nothing imported them by name,
+  # so it was harmless there and would have been silent anywhere else — a
+  # runtime library installed deeper than 6 levels would have come back
+  # "not in the closure".
+  #
+  # -iname, not -name: import names are lowercased at lookup, so a provider
+  # spelled LIBSPDLOG.DLL never entered the index and the claimed
+  # case-insensitivity was one-sided.  Demonstrated: renaming the provider
+  # turned a staged DLL into a build failure.
+  #
+  # Suffix selection is right HERE (unlike the roots, which go by content):
+  # this side is looked up by an import-table NAME, and an import name is a
+  # filename.  The extension list is the set of PE module extensions Windows
+  # actually loads by name.
   while IFS= read -r sp; do
     [ -d "$sp" ] || continue
-    find "$sp" -maxdepth 6 \( -type f -o -type l \) -name '*.dll' 2>/dev/null || true
-  done < "$CLOSURE_PATHS" > "$list"
+    find "$sp" \( -type f -o -type l \) \
+      \( -iname '*.dll' -o -iname '*.drv' -o -iname '*.ocx' \
+         -o -iname '*.cpl' -o -iname '*.pyd' \) 2>/dev/null || true
+  done < "$CLOSURE_PATHS" | sort > "$list"
   while IFS= read -r p; do
     parent="$(basename "$(dirname "$p")")"
     # Prefer the canonical install locations.  MinGW puts runtime DLLs in
@@ -303,6 +517,9 @@ pe_build_dll_index() {
     if [ -z "${pe_dll_prio[$key]:-}" ] || [ "$prio" -lt "${pe_dll_prio[$key]}" ]; then
       pe_dll_index[$key]="$p"
       pe_dll_prio[$key]="$prio"
+      pe_dll_alts[$key]="$p"
+    elif [ "$prio" -eq "${pe_dll_prio[$key]}" ]; then
+      pe_dll_alts[$key]="${pe_dll_alts[$key]} $p"
     fi
   done < "$list"
   total="$(wc -l < "$list")"
@@ -312,17 +529,51 @@ pe_build_dll_index() {
   local indexed=0
   [ -n "${pe_dll_index[*]+x}" ] && indexed="${#pe_dll_index[@]}"
   echo "  DLL index: $indexed distinct name(s) from $total file(s)" \
-       "across the closure"
-  # A zero here would make every later "unresolved import" a measurement bug
-  # rather than a real gap, so it is fatal on its own.
+       "across the closure (sorted; first-wins within a priority)"
+  # NOT fatal.  v1 exited here, one line after announcing IS_WINDOWS=1, and so
+  # failed `pkgsCross.mingwW64.hello` — a self-contained executable whose only
+  # imports are KERNEL32 and msvcrt legitimately has no .dll in its closure and
+  # needs nothing staged.  The reader control above is what makes a later zero
+  # trustworthy; this number is a fact about the input, so state it.
   if [ "$indexed" -eq 0 ]; then
-    echo "  ERROR: the dependency closure contains no .dll at all — the closure" \
-         "is wrong, or this is not a Windows build" >&2
-    exit 1
+    echo "  Note: the dependency closure contains no loadable PE module at all." \
+         "Nothing can be staged from it; every import will have to be satisfied" \
+         "by the host (a system DLL) or the build will say which one is missing."
   fi
+  pe_report_ambiguous_providers
 }
 
-# Case-insensitive "does this directory contain this name", memoised.
+# Ambiguity is normal and is NOT an error: 18 identical copies of libgcc are
+# what a Nix closure looks like.  What is not normal — and is the documented
+# Windows duplicate-statics shape — is two providers of the same name with
+# DIFFERENT content, where "first-wins" silently picks one.  Measured on the
+# real closure: 24 ambiguous names, every candidate set content-identical, so
+# this is silent on today's input and speaks exactly when it should.
+pe_report_ambiguous_providers() {
+  [ -n "${pe_dll_alts[*]+x}" ] || return 0
+  local key alts n ambiguous=0 diverging=0 h hashes
+  while IFS= read -r key; do
+    alts="${pe_dll_alts[$key]}"
+    # shellcheck disable=SC2086
+    set -- $alts
+    n=$#
+    [ "$n" -gt 1 ] || continue
+    ambiguous=$((ambiguous + 1))
+    hashes="$(for h in "$@"; do sha256sum "$h" 2>/dev/null | cut -d' ' -f1; done | sort -u | wc -l)"
+    if [ "$hashes" -gt 1 ]; then
+      diverging=$((diverging + 1))
+      echo "  WARNING: $n providers of '$key' differ in CONTENT; using" \
+           "${pe_dll_index[$key]}" >&2
+      for h in "$@"; do echo "      $h" >&2; done
+    fi
+  done < <(printf '%s\n' "${!pe_dll_alts[@]}" | sort)
+  echo "  Provider ambiguity: $ambiguous name(s) have >1 provider at the same" \
+       "priority; $diverging of them differ in content"
+}
+
+# Case-insensitive "does this directory contain this name", memoised.  The
+# value is the entry's REAL basename, not a bare 1, because a case-insensitive
+# hit still has to be copied by its actual name.
 declare -A pe_dir_have
 declare -A pe_dir_scanned
 
@@ -334,25 +585,9 @@ pe_dir_index() {
   for e in "$d"/*; do
     [ -e "$e" ] || continue
     key="$(basename "$e")"
-    pe_dir_have["$d|${key,,}"]=1
+    pe_dir_have["$d|${key,,}"]="$key"
   done
   return 0
-}
-
-# Every PE in the bundle whose imports must be satisfied.  Note that this
-# deliberately includes the staged Qt tree and the extra dirs: win-dll-link.sh
-# only ever processed $out/bin, and it is blind to anything LoadLibrary'd, so
-# plugins and QML module DLLs — and their dependencies — are missing from bin/
-# BY CONSTRUCTION.
-pe_roots() {
-  local d
-  find "$out/bin" -maxdepth 1 -type f 2>/dev/null || true
-  [ -d "$out/lib/$qt_stage" ] && \
-    { find "$out/lib/$qt_stage" -type f -name '*.dll' 2>/dev/null || true; }
-  for d in "${extra_dirs[@]+"${extra_dirs[@]}"}"; do
-    [ -d "$out/$d" ] || continue
-    find "$out/$d" -type f \( -name '*.dll' -o -name '*.exe' \) 2>/dev/null || true
-  done
 }
 
 # import name -> space-separated list of importers that wanted it
@@ -369,15 +604,15 @@ pe_staged_total=0
 # Qt6QmlCore is reachable only through a LoadLibrary'd QML plugin.
 pe_sweep() {
   local label="$1"
-  local round=0 added root rootdir ft imp key src dest
+  local round=0 added root rootdir imp key src dest roots_seen
   echo "  DLL closure sweep ($label):"
   pe_dir_index "$out/bin"
   while :; do
     round=$((round + 1))
     added=0
+    roots_seen=0
     while IFS= read -r root; do
-      ft="$(file -bL "$root" 2>/dev/null)" || continue
-      [[ "$ft" == *PE32* ]] || continue
+      roots_seen=$((roots_seen + 1))
       rootdir="$(dirname "$root")"
       pe_dir_index "$rootdir"
       while IFS= read -r imp; do
@@ -403,17 +638,17 @@ pe_sweep() {
           echo "  ERROR: staging $imp from $src produced no usable file" >&2
           exit 1
         fi
-        pe_dir_have["$out/bin|$key"]=1
+        pe_dir_have["$out/bin|$key"]="$imp"
         added=$((added + 1))
         pe_staged_total=$((pe_staged_total + 1))
         echo "    round $round  + $imp  <- ${root#$out/}  (from ${src%/*})"
       done < <(pe_imports "$root")
-      # pe_roots streams, and this loop writes into $out/bin while it does, so
+      # pe_files streams, and this loop writes into $out/bin while it does, so
       # whether a DLL staged mid-round is itself walked this round is
       # unspecified.  That is fine and is the reason for the outer loop: the
       # fixpoint, not the enumeration order, is what makes the result complete.
-    done < <(pe_roots)
-    echo "    round $round: $added DLL(s) added"
+    done < <(pe_files)
+    echo "    round $round: $roots_seen PE root(s) walked, $added DLL(s) added"
     [ "$added" -eq 0 ] && break
     if [ "$round" -ge 25 ]; then
       echo "  ERROR: the DLL import closure did not reach a fixpoint in $round rounds" >&2
@@ -421,8 +656,8 @@ pe_sweep() {
     fi
   done
   # Round 1 finding nothing means either a perfect bundle or a broken reader.
-  # The known-positive control for the reader lives in pe_build_dll_index /
-  # Phase 6; here just say what happened so a zero is never silent.
+  # pe_reader_control has already ruled out the second, before any sweep ran,
+  # so a zero here is a fact about the input.  Say what happened either way.
   echo "  DLL closure sweep ($label) converged after $round round(s);" \
        "$pe_staged_total DLL(s) staged so far"
 }
@@ -439,36 +674,113 @@ pe_sweep() {
 # Windows bundle whose platforms/ directory contains libqxcb.so and no
 # qwindows.dll.  Deciding by CONTENT rather than by store-path name is the
 # only test that cannot be fooled by naming.
+# Rejection by EVIDENCE, not acceptance by evidence.  v1 required the candidate
+# to contain at least one *.dll, which silently dropped a pure-QML module
+# package (qmldir + .qml, no plugin DLL — the normal shape of an app design
+# system): no warning, no log line, and off Windows the identical package IS
+# staged, so it was a Windows-only silent regression rather than parity.
+#
+#   contains a PE            -> accept (it is for the target)
+#   contains .so/.dylib only -> reject (this is the NATIVE Qt in a cross
+#                               closure, the case this predicate exists for)
+#   no native binaries at all -> accept (pure QML/data; it must ship)
+#
+# Every decision is logged with its reason, because an invisible accept/reject
+# is how a plugin tree goes missing without anyone noticing.
 qt_candidate_matches_target() {
   [ "$IS_WINDOWS" = "1" ] || return 0
-  local hit
-  hit="$(find "$1" \( -type f -o -type l \) -name '*.dll' -print -quit 2>/dev/null)"
-  [ -n "$hit" ]
+  local dir="$1" f found_pe=0 found_foreign=0
+  while IFS= read -r f; do
+    if pe_is_pe "$f"; then found_pe=1; break; fi
+    case "$f" in
+      *.so|*.so.*|*.dylib) found_foreign=1 ;;
+    esac
+    # stderr is dropped on BOTH stages: this loop breaks as soon as it sees a
+    # PE, which leaves find and sort writing into a closed pipe and printing
+    # "write failed: Broken pipe" from inside the success path.
+  done < <(find "$dir" \( -type f -o -type l \) 2>/dev/null | sort 2>/dev/null)
+  if [ "$found_pe" = "1" ]; then
+    return 0
+  fi
+  if [ "$found_foreign" = "1" ]; then
+    echo "  Rejecting Qt tree (host-format binaries, no PE — this is the native" \
+         "Qt of the cross build): $dir"
+    return 1
+  fi
+  echo "  Accepting Qt tree with no native binaries at all (pure QML/data): $dir"
+  return 0
+}
+
+# Merge-copy a Qt tree into the staging directory.
+#
+# `cp -aLn` is deliberately error-TOLERANT here: several store paths contribute
+# overlapping subtrees and `-n` turns the later ones into no-ops, which some
+# coreutils report as failures.  But "tolerant" was implemented as
+# `2>/dev/null || true`, which also swallowed the errors that mean a file was
+# LOST — that is how a symlinked qmldir vanished while the build printed
+# "verified 50 DLL(s) present" and exited 0.  Keep the tolerance; stop keeping
+# the silence.
+#
+# The reporting is Windows-only so the Unix log stays byte-identical; the
+# copy itself is unchanged on every platform.
+qt_merge_copy() {
+  local candidate="$1" dest="$2" what="$3"
+  local err
+  mkdir -p "$dest"
+  err="$(mktemp)"
+  cp -aLn "$candidate"/. "$dest/" 2>"$err" || true
+  chmod -R u+w "$dest" 2>/dev/null || true
+  if [ "$IS_WINDOWS" = "1" ] && [ -s "$err" ]; then
+    echo "  $what: cp reported $(wc -l < "$err") message(s) while copying $candidate:"
+    sed 's/^/    /' "$err"
+  fi
+  rm -f "$err"
+  return 0
 }
 
 # After a merge-copy, prove every file that was supposed to arrive actually
-# arrived.  `cp -aLn` swallows its own errors here (`2>/dev/null || true`), so
-# without this the copy is a pure act of faith — and this repo has already lost
-# 75% of a payload to exactly that, while exiting 0.
+# arrived.
+#
+# Over EVERY entry, not `-name '*.dll'`.  The DLL filter inspected 50 of 1651
+# files (3%) of the QML tree while its comment claimed it proved "every file
+# that was supposed to arrive actually arrived" — so a lost qmldir, which makes
+# a QML module unloadable, was invisible and the build exited 0.
+#
+# Must be called BEFORE the non-runtime cleanup, which deliberately deletes
+# QtTest/, QmlTime/, *.a and *.prl: checking afterwards would report those
+# intentional removals as copy losses.
 qt_assert_staged() {
   local dest="$1" what="$2"
   shift 2
-  local cand rel missing=0 checked=0
+  local cand src rel missing=0 checked=0 n empty_cands=0
   for cand in "$@"; do
+    n=0
     while IFS= read -r src; do
       rel="${src#"$cand"/}"
       checked=$((checked + 1))
-      if [ ! -f "$dest/$rel" ] || [ -L "$dest/$rel" ]; then
+      n=$((n + 1))
+      # `-L` is part of the test, not redundant with `-e`: cp -aL is supposed to
+      # DEREFERENCE, so a symlink arriving as a symlink means it pointed
+      # outside the store path and will dangle once the bundle moves.
+      if [ ! -e "$dest/$rel" ] || [ -L "$dest/$rel" ]; then
         echo "  ERROR: $what: $rel did not survive the copy from $cand" >&2
         missing=$((missing + 1))
       fi
-    done < <(find "$cand" \( -type f -o -type l \) -name '*.dll' 2>/dev/null)
+    done < <(find "$cand" \( -type f -o -type l \) 2>/dev/null)
+    if [ "$n" -eq 0 ]; then
+      empty_cands=$((empty_cands + 1))
+      echo "  $what: $cand contributed no files"
+    fi
   done
-  echo "  $what: verified $checked DLL(s) present in ${dest#"$out"/}"
+  echo "  $what: verified $checked file(s) present in ${dest#"$out"/}" \
+       "($# candidate(s), $empty_cands of them empty)"
+  # NOT an exit.  v1 treated zero as "a bug, not an empty input", which was only
+  # true while qt_candidate_matches_target guaranteed >= 1 DLL per candidate —
+  # it no longer does, and an empty tree is a legitimate input.  Whether an
+  # empty RESULT is fatal is Phase 6's contract check to decide, with the whole
+  # bundle in view.
   if [ "$checked" -eq 0 ]; then
-    echo "  ERROR: $what: staged zero DLLs — an empty result here is a bug," >&2
-    echo "  not an empty input" >&2
-    exit 1
+    echo "  $what: nothing to verify — every accepted candidate was empty"
   fi
   if [ "$missing" -gt 0 ]; then
     echo "  ERROR: $what: $missing file(s) lost in the copy" >&2
@@ -662,6 +974,13 @@ trace_deps() {
 if [ "$IS_WINDOWS" = "1" ]; then
   echo "  PE: rpath tracing does not apply (an import table carries base names"
   echo "  only); resolving the DLL import closure instead."
+  pe_resolve_objdump
+  # The reader control runs FIRST, before the index and before any sweep.
+  # Everything after it interprets an empty import list as "already satisfied";
+  # this is the one place where an empty import list is interpreted as "the
+  # reader is broken", and it has to come before anything relies on the other
+  # reading.
+  pe_reader_control
   pe_build_dll_index
   # First sweep.  It cannot be the last one — the Qt plugin and QML trees are
   # not staged until Phase 2b, and their DLLs are exactly the ones no import
@@ -783,9 +1102,7 @@ elif [ "$qt_detected" = "1" ]; then
     for candidate in "$storePath/lib/qt-6/plugins" "$storePath/lib/qt-5/plugins" "$storePath/share/qt-6/plugins" "$storePath/share/qt-5/plugins" "$storePath/lib/qt6/plugins" "$storePath/lib/qt5/plugins"; do
       if [ -d "$candidate" ] && qt_candidate_matches_target "$candidate"; then
         echo "  Found Qt plugins: $candidate"
-        mkdir -p "$qt_plugins_dir"
-        cp -aLn "$candidate"/. "$qt_plugins_dir/" 2>/dev/null || true
-        chmod -R u+w "$qt_plugins_dir" 2>/dev/null || true
+        qt_merge_copy "$candidate" "$qt_plugins_dir" "Qt plugins"
         qt_accepted_candidates+=("$candidate")
         qt_plugins_found=1
         break  # only one candidate per store path
@@ -794,6 +1111,13 @@ elif [ "$qt_detected" = "1" ]; then
   done < "$CLOSURE_PATHS"
 
   if [ "$qt_plugins_found" = "1" ]; then
+    # BEFORE the cleanup below, which deletes *.a / *.prl / objects-Release on
+    # purpose: an assertion that runs afterwards reports every intentional
+    # removal as a copy loss.  (v1 checked afterwards and got away with it only
+    # because it looked at *.dll and nothing else.)
+    if [ "$IS_WINDOWS" = "1" ]; then
+      qt_assert_staged "$qt_plugins_dir" "Qt plugins" "${qt_accepted_candidates[@]}"
+    fi
     # Remove build artifacts from plugins (static libs, build metadata).
     # MinGW's import libraries are `libfoo.dll.a`, which `*.a` already matches
     # — checked, because "unsuffixed / MSVC-shaped glob" is a recurring bug in
@@ -805,7 +1129,6 @@ elif [ "$qt_detected" = "1" ]; then
     find "$qt_plugins_dir" -type d -empty -delete 2>/dev/null || true
 
     if [ "$IS_WINDOWS" = "1" ]; then
-      qt_assert_staged "$qt_plugins_dir" "Qt plugins" "${qt_accepted_candidates[@]}"
       echo "  PE: plugin imports are resolved by the DLL closure sweep in Phase 2e"
     else
       # Trace deps of all plugin shared libraries
@@ -818,9 +1141,10 @@ elif [ "$qt_detected" = "1" ]; then
     # Not a warning on Windows.  Without platforms/qwindows.dll the app dies
     # with "Could not find the Qt platform plugin", and the whole reason this
     # branch exists is that the previous behaviour was to exit 0 regardless.
-    echo "  ERROR: Qt was detected in bin/ but no Qt plugin directory containing" >&2
-    echo "  DLLs was found anywhere in the closure.  qtbase's plugins are almost" >&2
-    echo "  certainly missing from closureInfo — add it to extraClosurePaths." >&2
+    echo "  ERROR: Qt was detected in bin/ but no Qt plugin directory for this" >&2
+    echo "  target was found anywhere in the closure.  qtbase's plugins are" >&2
+    echo "  almost certainly missing from closureInfo — add it to" >&2
+    echo "  extraClosurePaths." >&2
     exit 1
   else
     echo "  Warning: Qt detected but no plugins directory found in closure"
@@ -828,21 +1152,25 @@ elif [ "$qt_detected" = "1" ]; then
 
   # Bundle QML modules only when the derivation actually uses QtQml/QtQuick.
   # Non-UI derivations (e.g. using only QtCore/QtNetwork) don't need QML.
-  qml_needed=0
-  if [ "$IS_WINDOWS" = "1" ]; then
-    # Windows FIRST — this used to be the `else` arm of an IS_DARWIN test, so a
-    # PE bundle fell into the Unix arm and its `.so` glob, and QML staging was
-    # skipped even once the plugin gate above was fixed.
-    #
-    # These DLLs are in bin/ only because the pass-1 DLL closure sweep put them
-    # there: the .exe imports neither Qt6Qml nor Qt6Quick, the UI plugin does.
+  #
+  # Windows FIRST — this used to be the `else` arm of an IS_DARWIN test, so a
+  # PE bundle fell into the Unix arm and its `.so` glob, and QML staging was
+  # skipped even once the plugin gate above was fixed.
+  #
+  # These DLLs are in bin/ only because the DLL closure sweep put them there:
+  # the .exe imports neither Qt6Qml nor Qt6Quick, the UI plugin does.  That is
+  # also why this is a FUNCTION and not a one-shot test — see Phase 2e.
+  win_qml_gate() {
+    local f
     for f in "$out"/bin/Qt6Qml*.dll "$out"/bin/Qt6Quick*.dll \
              "$out"/bin/Qt5Qml*.dll "$out"/bin/Qt5Quick*.dll; do
-      if [ -e "$f" ]; then
-        qml_needed=1
-        break
-      fi
+      [ -e "$f" ] && return 0
     done
+    return 1
+  }
+  qml_needed=0
+  if [ "$IS_WINDOWS" = "1" ]; then
+    win_qml_gate && qml_needed=1
   elif [ "$IS_DARWIN" = "1" ]; then
     for fw in "${!framework_map[@]}"; do
       if [[ "$fw" == QtQml* ]] || [[ "$fw" == QtQuick* ]]; then
@@ -861,16 +1189,19 @@ elif [ "$qt_detected" = "1" ]; then
 
   qt_qml_found=0
   qml_accepted_candidates=()
-  if [ "$qml_needed" = "1" ]; then
+
+  # The QML staging pass, as a function, so Phase 2e can run it a second time
+  # if the DLL sweep turns the gate above from 0 to 1 after the fact.  On every
+  # non-Windows platform this is called exactly once, from exactly where the
+  # inline block used to be, and emits exactly what it used to emit.
+  stage_qml_modules() {
     echo "  Bundling QML modules..."
     while IFS= read -r storePath; do
       for candidate in "$storePath/lib/qt-6/qml" "$storePath/lib/qt-5/qml" "$storePath/share/qt-6/qml" "$storePath/share/qt-5/qml" "$storePath/lib/qt6/qml" "$storePath/lib/qt5/qml"; do
         if [ -d "$candidate" ] && qt_candidate_matches_target "$candidate"; then
           echo "  Found QML modules: $candidate"
-          mkdir -p "$qt_qml_dir"
           # Merge contents (multiple store paths may contribute different modules)
-          cp -aLn "$candidate"/. "$qt_qml_dir/" 2>/dev/null || true
-          chmod -R u+w "$qt_qml_dir" 2>/dev/null || true
+          qt_merge_copy "$candidate" "$qt_qml_dir" "QML modules"
           qml_accepted_candidates+=("$candidate")
           qt_qml_found=1
         fi
@@ -879,7 +1210,7 @@ elif [ "$qt_detected" = "1" ]; then
 
     if [ "$IS_WINDOWS" = "1" ] && [ "$qt_qml_found" = "0" ]; then
       echo "  ERROR: QtQuick/QtQml DLLs are in bin/, so this bundle renders QML," >&2
-      echo "  but no QML module directory containing DLLs was found in the" >&2
+      echo "  but no QML module directory for this target was found in the" >&2
       echo "  closure.  qtdeclarative is missing from closureInfo — add it to" >&2
       echo "  extraClosurePaths.  (A PE embeds no store paths, so nothing pulls" >&2
       echo "  qtdeclarative into the closure on its own.)" >&2
@@ -956,6 +1287,10 @@ elif [ "$qt_detected" = "1" ]; then
         fi
       done < <(find "$out/lib" -name 'qmldir' -not -path "*/$qt_stage/*")
     fi
+  }
+
+  if [ "$qml_needed" = "1" ]; then
+    stage_qml_modules
   else
     echo "  Skipping QML bundling (no QtQml/QtQuick libraries detected)"
   fi
@@ -967,27 +1302,16 @@ elif [ "$qt_detected" = "1" ]; then
   # ("libexec", ".", "translations") relative to Prefix.  QtWebEngine looks up
   # QtWebEngineProcess via LibraryExecutablesPath and its .pak/icudtl.dat via
   # DataPath + "/resources", so getting these wrong breaks the webview plugin.
-  if [ -d "$out/bin" ]; then
+  if [ "$IS_WINDOWS" = "1" ]; then
+    # DEFERRED to Phase 2f, on purpose.  Written here, qt.conf describes the
+    # tree that is predicted to exist rather than the tree that does: v1 emitted
+    # `Qml2Imports = lib/qt-6/qml` pointing at a directory that was never
+    # created, because the QML gate was decided before the sweep that stages the
+    # very DLLs the gate tests for.
+    :
+  elif [ -d "$out/bin" ]; then
     echo "  Creating qt.conf..."
-    if [ "$IS_WINDOWS" = "1" ]; then
-      # Every key is named explicitly, and that is not tidiness.  Measured on
-      # real Windows: setting Prefix alone makes Qt report
-      #     Could not find the Qt platform plugin "windows" in ""
-      # — an empty search path, not a wrong one.  Libraries and Binaries both
-      # point at bin/ because MinGW puts every DLL there, Qt's own included.
-      # Imports and Qml2Imports are both set: Qt 6 reads Qml2Imports, but the
-      # bundle should not depend on which spelling a given build honours.
-      cat > "$out/bin/qt.conf" <<QTCONFWIN
-[Paths]
-Prefix = ..
-Libraries = bin
-Binaries = bin
-Plugins = lib/$qt_stage/plugins
-Imports = lib/$qt_stage/qml
-Qml2Imports = lib/$qt_stage/qml
-QTCONFWIN
-    else
-      cat > "$out/bin/qt.conf" <<QTCONF
+    cat > "$out/bin/qt.conf" <<QTCONF
 [Paths]
 Prefix = ..
 Plugins = lib/qt/plugins
@@ -996,14 +1320,17 @@ Data = .
 Translations = translations
 $([ "$qt_qml_found" = "1" ] && echo "QmlImports = lib/qt/qml")
 QTCONF
-    fi
   fi
-else
+elif [ "$IS_WINDOWS" = "1" ]; then
   # The missing arm.  Until now qt_detected=0 skipped the plugin scan, the QML
   # scan and qt.conf in silence — which is exactly how a Windows bundle came
   # out with an empty lib/, no qt.conf and no qwindows.dll while exiting 0.
   # A non-Qt bundle reaching here is perfectly normal, so this is a statement,
   # not a warning; the point is that the skip is now visible in the log.
+  #
+  # Windows-only: on Unix the skip has never produced a broken bundle, and an
+  # extra line there is a real (if small) change to a log this branch is
+  # otherwise required to leave byte-identical.
   echo "Phase 2b: Skipping Qt plugin/QML bundling (no Qt libraries in this bundle)"
 fi
 
@@ -1019,20 +1346,81 @@ fi
 if [ "$IS_WINDOWS" = "1" ]; then
   echo "Phase 2e: Completing the PE import closure over the staged Qt tree..."
   pe_sweep "pass 2: + Qt plugins and QML modules"
+
+  # The QML staging DECISION is itself a fixpoint, not a one-shot test.
+  #
+  # The gate reads bin/Qt6Qml*.dll / Qt6Quick*.dll, and the sweep above is what
+  # puts those DLLs in bin/ — qtdeclarative's qmltooling plugins are staged
+  # unconditionally by Phase 2b and import Qt6Qml.  So a bundle could log
+  # "Skipping QML bundling (no QtQml/QtQuick libraries detected)", then acquire
+  # Qt6Qml.dll, Qt6Quick.dll, Qt6QmlModels.dll, Qt6QmlMeta.dll and
+  # Qt6QmlWorkerScript.dll one phase later, and ship a qt.conf whose
+  # Qml2Imports pointed at a directory that was never created.  Exit 0.
+  #
+  # Re-evaluating here removes the order dependence: whatever the enumeration
+  # order was, the answer at the end is the same.  Bounded and loud, because an
+  # unbounded restaging loop would be a worse bug than the one it fixes.
+  qml_restage_round=0
+  while [ "$qt_detected" = "1" ] && [ "$qt_is_host" != "1" ] \
+        && [ "${qt_qml_found:-0}" = "0" ] && win_qml_gate; do
+    qml_restage_round=$((qml_restage_round + 1))
+    if [ "$qml_restage_round" -gt 3 ]; then
+      echo "  ERROR: the QML staging decision did not stabilise in" \
+           "$qml_restage_round rounds" >&2
+      exit 1
+    fi
+    echo "  The DLL sweep put QtQml/QtQuick in bin/ after the QML gate was" \
+         "evaluated; staging QML modules now (round $qml_restage_round)"
+    qml_needed=1
+    stage_qml_modules
+    pe_sweep "pass $((2 + qml_restage_round)): + QML modules staged after the gate flipped"
+  done
+
   pe_fail_on_unresolved
+  # A statement, not an exit.  v1 exited here on the grounds that "a real Qt
+  # bundle always needs at least one", which is true of a real Qt bundle and
+  # false of the input: a self-contained executable whose imports are all system
+  # DLLs stages nothing and is correct.  The reader control in Phase 2 is what
+  # makes this zero trustworthy — it proved the reader reads before any of this
+  # ran — so a zero here is a fact about the bundle.
   if [ "$pe_staged_total" -eq 0 ]; then
-    echo "  ERROR: the DLL closure sweep staged zero DLLs.  win-dll-link.sh only" >&2
-    echo "  ever processes bin/ and is blind to LoadLibrary, so a real Qt bundle" >&2
-    echo "  always needs at least one — a zero means the import reader returned" >&2
-    echo "  nothing, not that the bundle was already complete." >&2
-    exit 1
+    echo "  DLL closure complete: nothing needed staging — every import was" \
+         "already satisfied from bin/, from the importer's own directory, or by" \
+         "a Windows system DLL."
+  else
+    echo "  DLL closure complete: $pe_staged_total DLL(s) staged into bin/"
   fi
-  echo "  DLL closure complete: $pe_staged_total DLL(s) staged into bin/"
   if [ -e "$out/bin/Qt6WebEngineCore.dll" ]; then
     echo "  WARNING: Qt6WebEngineCore.dll is in this bundle, but Phase 2d's" >&2
     echo "  QtWebEngine runtime-data staging has no Windows detection arm, so" >&2
     echo "  QtWebEngineProcess.exe, resources/ and the locale .pak files are NOT" >&2
     echo "  bundled.  The webview will fail at runtime." >&2
+  fi
+
+  # =========================================================================
+  # Phase 2f — Windows: qt.conf, written last
+  # =========================================================================
+  # After the final sweep and after any late QML staging, so it describes the
+  # tree that exists.
+  #
+  # Every key is named explicitly, and that is not tidiness.  Measured on real
+  # Windows: setting Prefix alone makes Qt report
+  #     Could not find the Qt platform plugin "windows" in ""
+  # — an empty search path, not a wrong one.  Libraries and Binaries both point
+  # at bin/ because MinGW puts every DLL there, Qt's own included.  Imports and
+  # Qml2Imports are both set: Qt 6 reads Qml2Imports, but the bundle should not
+  # depend on which spelling a given build honours.
+  if [ "$qt_detected" = "1" ] && [ "$qt_is_host" != "1" ] && [ -d "$out/bin" ]; then
+    echo "Phase 2f: Creating qt.conf..."
+    cat > "$out/bin/qt.conf" <<QTCONFWIN
+[Paths]
+Prefix = ..
+Libraries = bin
+Binaries = bin
+Plugins = lib/$qt_stage/plugins
+Imports = lib/$qt_stage/qml
+Qml2Imports = lib/$qt_stage/qml
+QTCONFWIN
   fi
 fi
 
@@ -1797,30 +2185,15 @@ if [ "$IS_WINDOWS" = "1" ]; then
   win_errors=0
 
   # -- known-positive control for the import reader -------------------------
-  # Every "0 unresolved imports" below is only meaningful if the reader works
-  # at all.  Prove it on a file that certainly has imports, and fail if it
-  # comes back empty, rather than reporting a zero we never controlled for.
-  control_file=""
-  for f in "$out"/bin/*; do
-    [ -f "$f" ] || continue
-    ft="$(file -bL "$f" 2>/dev/null)" || continue
-    case "$ft" in *PE32*"(DLL)"*) ;; *PE32*) control_file="$f"; break ;; esac
-  done
-  if [ -z "$control_file" ]; then
-    echo "  ERROR: no PE executable in bin/ to use as an import-reader control" >&2
-    exit 1
-  fi
-  control_imports="$(pe_imports "$control_file" | grep -c . || true)"
-  echo "  Import-reader control: $(basename "$control_file") declares" \
-       "$control_imports import(s)"
-  if [ "$control_imports" -eq 0 ]; then
-    echo "  ERROR: the import reader returned nothing for a PE executable." \
-         "Every later zero would be a measurement bug, not a clean bundle." >&2
-    exit 1
-  fi
+  # The real control ran in Phase 2, BEFORE the first sweep, because every
+  # staging decision depends on it — see pe_reader_control.  Restating it here
+  # would only re-prove what the sweep already relied on.  What this line does
+  # is name the reader in the log, so a green Phase 6 can be traced to the
+  # binary that produced it.
+  echo "  Import-table reader: $pe_objdump (proved non-empty in Phase 2)"
 
   # -- bundle contract ------------------------------------------------------
-  if [ "$qt_detected" = "1" ]; then
+  if [ "$qt_detected" = "1" ] && [ "$qt_is_host" != "1" ]; then
     if [ ! -f "$out/bin/qt.conf" ]; then
       echo "  ERROR: bin/qt.conf is missing; Qt would search an empty plugin path" >&2
       win_errors=$((win_errors + 1))
@@ -1836,20 +2209,57 @@ if [ "$IS_WINDOWS" = "1" ]; then
            "a GUI app cannot create a window without the QPA plugin" >&2
       win_errors=$((win_errors + 1))
     fi
+    # Presence-only, non-fatal.  These directories are reached by LoadLibrary
+    # with a name Qt computes at runtime, so no import table mentions them and
+    # static analysis cannot prove they are needed — nor that they are not.
+    # Saying which are absent is the most this check can honestly do.
+    for _d in styles imageformats tls iconengines; do
+      if [ ! -d "$qt_plugins_dir/$_d" ]; then
+        echo "  Note: no $_d/ plugin directory was staged.  Qt loads these by" \
+             "computed name; if the app asks for one it will fail at runtime" \
+             "and nothing here can predict that."
+      fi
+    done
   fi
+
+  # BOTH directions.  v1 asserted only "QML staged => Qt6Quick.dll", which is
+  # why nothing caught the converse: Qt6Quick.dll in bin/ with an empty QML
+  # tree, and a qt.conf naming a Qml2Imports directory that does not exist.
+  win_qml_entries=0
+  [ -d "$qt_qml_dir" ] && win_qml_entries="$(find "$qt_qml_dir" -mindepth 1 2>/dev/null | wc -l)"
+  echo "  QML import tree: $win_qml_entries entr(y/ies) under ${qt_qml_dir#"$out"/}"
   if [ "${qt_qml_found:-0}" = "1" ] && [ ! -f "$out/bin/Qt6Quick.dll" ]; then
     echo "  ERROR: QML modules were staged but bin/Qt6Quick.dll is missing" >&2
     win_errors=$((win_errors + 1))
   fi
+  if [ -f "$out/bin/Qt6Quick.dll" ] && [ "$win_qml_entries" -eq 0 ]; then
+    echo "  ERROR: bin/Qt6Quick.dll is in this bundle but the QML import tree" \
+         "${qt_qml_dir#"$out"/} is empty or absent; qt.conf would name a" \
+         "directory that does not exist" >&2
+    win_errors=$((win_errors + 1))
+  fi
 
   # -- nothing was lost, and nothing dangles --------------------------------
+  # By SET, not by count.  The count comparison this replaces ran after the
+  # sweep had already added ~60 files to bin/ (19 -> 80 on the real bundle), so
+  # a Phase 1 loss of up to 60 source entries would still have passed it.  The
+  # tight count check does still exist — in Phase 1c, before the sweep, where
+  # the arithmetic is still meaningful.
   win_src_bin=0
-  [ -d "$DRV_PATH/bin" ] && win_src_bin="$(find "$DRV_PATH/bin" -maxdepth 1 -mindepth 1 | wc -l)"
+  win_lost_names=0
+  if [ -d "$DRV_PATH/bin" ]; then
+    while IFS= read -r n; do
+      win_src_bin=$((win_src_bin + 1))
+      [ -e "$out/bin/$n" ] && continue
+      echo "  ERROR: bin/$n is in the source derivation but not in the bundle" >&2
+      win_lost_names=$((win_lost_names + 1))
+    done < <(find "$DRV_PATH/bin" -maxdepth 1 -mindepth 1 -printf '%f\n' | sort)
+  fi
   win_out_bin="$(find "$out/bin" -maxdepth 1 -mindepth 1 | wc -l)"
-  echo "  bin/ entries: $win_src_bin in the source derivation -> $win_out_bin in the bundle"
-  if [ "$win_out_bin" -lt "$win_src_bin" ]; then
-    echo "  ERROR: the bundle's bin/ has fewer entries than the source derivation" >&2
-    win_errors=$((win_errors + 1))
+  echo "  bin/ entries: $win_src_bin in the source derivation, all present by" \
+       "name in the bundle's $win_out_bin ($win_lost_names missing)"
+  if [ "$win_lost_names" -gt 0 ]; then
+    win_errors=$((win_errors + win_lost_names))
   fi
   win_dangling="$(find "$out" -xtype l 2>/dev/null | wc -l)"
   if [ "$win_dangling" -gt 0 ]; then
@@ -1866,9 +2276,10 @@ if [ "$IS_WINDOWS" = "1" ]; then
   echo "  Verifying every PE import resolves inside the bundle..."
   win_pe_files=0
   win_import_names=0
+  # Same enumeration the sweep used — pe_files — so the fixer and the checker
+  # cannot disagree about what a root is.  That asymmetry was a build failure
+  # on valid input, twice.
   while IFS= read -r f; do
-    ft="$(file -bL "$f" 2>/dev/null)" || continue
-    [[ "$ft" == *PE32* ]] || continue
     win_pe_files=$((win_pe_files + 1))
     fdir="$(dirname "$f")"
     pe_dir_index "$fdir"
@@ -1883,8 +2294,11 @@ if [ "$IS_WINDOWS" = "1" ]; then
            "own directory" >&2
       win_errors=$((win_errors + 1))
     done < <(pe_imports "$f")
-  done < <(find "$out" -type f)
+  done < <(pe_files)
   echo "  Checked $win_pe_files PE file(s), $win_import_names import name(s)"
+  # win_pe_files == 0 is already impossible: Phase 1c hard-errors when Nix says
+  # Windows and the tree holds no PE.  win_import_names == 0 across a non-empty
+  # set of PEs would mean the reader went blind between Phase 2 and here.
   if [ "$win_pe_files" -eq 0 ] || [ "$win_import_names" -eq 0 ]; then
     echo "  ERROR: found no PE files or no import names to check — this pass" \
          "measured nothing, so its clean result means nothing" >&2
@@ -1895,7 +2309,19 @@ if [ "$IS_WINDOWS" = "1" ]; then
     echo "FAILED: $win_errors Windows bundle contract violation(s)"
     exit 1
   fi
-  echo "  Windows bundle contract satisfied."
+  # Deliberately NOT "Windows bundle contract satisfied", which reads as
+  # "starts on Windows" and is not what was checked.  Nothing in this build ran
+  # on Windows; what it proved is a property of import TABLES.  A DLL reached
+  # by LoadLibrary with a name computed at runtime — a Qt style plugin selected
+  # by name, d3dcompiler, ANGLE — appears in no import table, so it is covered
+  # only by the presence checks above, and a bundle can still exit 0xC0000135
+  # before main() despite everything here being green.
+  echo "  PE import tables: every one of the $win_import_names import name(s)" \
+       "across $win_pe_files PE file(s) resolves inside the bundle or to a" \
+       "Windows system DLL."
+  echo "  NOT checked (uncheckable statically): DLLs loaded by a name computed" \
+       "at runtime.  Those are covered only by the directory presence checks" \
+       "above."
 fi
 
 test_dir="$(mktemp -d)"
@@ -1994,13 +2420,25 @@ find "$test_dir" -type f | while IFS= read -r f; do
 done
 
 # Check for /nix/ paths embedded in binary data.
-# PE is included: this check is the one part of Phase 6 that is genuinely
-# format-agnostic — it is a string scan — and skipping PEs made a Windows
-# bundle pass it vacuously.
+# PE is included ON WINDOWS: this check is the one part of Phase 6 that is
+# genuinely format-agnostic — it is a string scan — and skipping PEs made a
+# Windows bundle pass it vacuously.
+#
+# The IS_WINDOWS guard is load-bearing, not decoration.  Unguarded, this arm
+# changes Linux and macOS behaviour: a non-Windows bundle that merely CARRIES a
+# PE as data gets string-scanned, and under `warnOnBinaryData = false` — which
+# is what `bundlers.default` passes — a single /nix/ string inside it becomes a
+# hard build failure. Demonstrated on x86_64-linux: bin/run.sh + a real PE32+
+# with one appended /nix/ line exits 0 on the base bundler and 1 with the arm
+# unguarded.
 echo "  Checking for embedded /nix/ paths..."
 find "$test_dir" -type f | while IFS= read -r f; do
   filetype="$(file -b "$f" 2>/dev/null)" || continue
-  [[ "$filetype" == *Mach-O* || "$filetype" == *ELF* || "$filetype" == *PE32* ]] || continue
+  case "$filetype" in
+    *Mach-O*|*ELF*) ;;
+    *PE32*)         [ "$IS_WINDOWS" = "1" ] || continue ;;
+    *)              continue ;;
+  esac
   rel="${f#$test_dir/}"
   nix_refs="$(strings "$f" 2>/dev/null | grep -c '/nix/' || true)"
   if [ "$nix_refs" -gt 0 ]; then
