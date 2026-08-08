@@ -84,13 +84,25 @@ let
 
   # The PE import-table reader, taken from the TARGET's own toolchain.
   #
-  # Not `objdump` off PATH. On x86_64-linux the ambient binutils happens to
-  # support pei-x86-64 (checked: `objdump --info` lists pei-i386, pe-x86-64,
-  # pei-x86-64), which is why calling bare `objdump` appeared to work — but the
-  # same expression on an aarch64-linux or darwin builder yields an objdump with
-  # no PE target, and that objdump reports ZERO imports for every file and exits
-  # 0. A silent zero from the reader is indistinguishable from a complete
-  # bundle, so the reader must not depend on the builder's architecture.
+  # Not `objdump` off PATH — but NOT because the ambient objdump is known to be
+  # blind. That is what this comment used to claim, and it is not what is
+  # measured. On x86_64-linux the ambient binutils supports pei-x86-64
+  # (`objdump --info` lists pei-i386, pe-x86-64, pei-x86-64). On aarch64-darwin
+  # the objdump that mkBundle already puts on PATH for every Darwin build —
+  # darwin.cctools, i.e. LLVM objdump — also reads PE: measured against a real
+  # PE32+ DLL from this store (mcfgthread-x86_64-w64-mingw32), it printed
+  # `file format coff-x86-64` and the file's DLL Name entries. So the honest
+  # statement is that neither reader has been observed to fail.
+  #
+  # The reason to take the reader from the target anyway is that "does this
+  # builder's objdump happen to have a PE target?" is a property of the
+  # BUILDER's toolchain, which nothing in this expression controls and which
+  # changes under us; and the failure mode when the answer is no is a silent
+  # zero — an empty import list, exit 0 — which is indistinguishable from a
+  # complete bundle. Choosing the reader by target removes the question rather
+  # than betting on its current answer, and pe_reader_control in bundle.sh
+  # proves the chosen reader actually reads a PE before any zero it returns is
+  # believed, whichever reader that turns out to be.
   #
   # `targetStdenv.cc.bintools.bintools` is the raw binutils derivation (the
   # outer two are wrappers); for pkgsCross.mingwW64 it evaluates to
@@ -195,18 +207,30 @@ pkgs.stdenv.mkDerivation {
     patchelf
   ]
   # PE bundles need an import-table reader, and only PE bundles do. Both
-  # entries are conditional so a Unix bundle's build inputs — and therefore
-  # everything about its build except the derivation hash, which every added
-  # env var below already changes — stay as they were.
+  # entries are conditional so a Unix bundle's build inputs stay as they were.
   ++ pkgs.lib.optionals (crossBintools != null) [ crossBintools ]
   ++ pkgs.lib.optionals (isWindowsStr != "0" && crossBintools == null && !isDarwin) [
     # Fallback for `windowsTarget = true` on a drv with no cross toolchain to
-    # borrow from, and for the unknown-target case. bundle.sh proves the reader
-    # works before it trusts any zero it produces, so a wrong objdump here is a
-    # loud failure rather than an empty bundle.
+    # borrow from, and for the unknown-target case. Less load-bearing than it
+    # looks — see the PE_OBJDUMP note above: on the builders measured so far the
+    # ambient objdump reads PE perfectly well, so this is a belt for a case
+    # nobody has yet observed rather than a known-broken path. bundle.sh proves
+    # the reader works before it trusts any zero it produces, so a wrong objdump
+    # here is a loud failure rather than an empty bundle.
     binutils
   ];
 
+  # EVERY bundle's store path changes when this branch lands, on every platform,
+  # even where the produced tree is byte-for-byte what it was. That is worth
+  # stating because a consumer that RECORDS a bundle's path — an .lgx built from
+  # one, a pinned artefact — sees a new hash and must re-fetch.
+  #
+  # It is also unavoidable and is not caused by the two PE env vars below.
+  # `buildPhase` names ${./bundle.sh} by store path, so the script IS an input:
+  # any edit to the bundler rehashes every bundle it produces. Dropping
+  # IS_WINDOWS/PE_OBJDUMP on the Unix path would buy nothing and would cost the
+  # one distinction bundle.sh's Phase 1c relies on ("0" = Nix says Unix,
+  # "unknown" = the drv carries no stdenv to ask).
   CLOSURE_PATHS = "${closureInfo}/store-paths";
   DRV_PATH = "${drv}";
   IS_DARWIN = if isDarwin then "1" else "0";
