@@ -165,22 +165,11 @@ done
 # "symbolic link to ..." and never "PE32+", which reads as a confident zero.
 IS_WINDOWS="${IS_WINDOWS:-unknown}"
 
-# Count bin/'s formats once.  Cheap (bin/ is small), and both the unknown-target
-# fallback and the contradiction checks want it.
-pe_exe_count=0
-pe_dll_count=0
-unix_bin_count=0
-if [ -d "$out/bin" ]; then
-  for f in "$out"/bin/*; do
-    [ -f "$f" ] || continue
-    ft="$(file -bL "$f" 2>/dev/null)" || continue
-    case "$ft" in
-      *PE32*"(DLL)"*)   pe_dll_count=$((pe_dll_count + 1)) ;;
-      *PE32*)           pe_exe_count=$((pe_exe_count + 1)) ;;
-      *Mach-O*|*ELF*)   unix_bin_count=$((unix_bin_count + 1)) ;;
-    esac
-  done
-fi
+# (The per-entry `file -bL` scan of bin/ that used to sit here is gone with its
+# two consumers — the unknown-target fallback and the Unix-arm contradiction
+# check. Both were removed above, and its three counters were then assigned and
+# never read, so every non-Windows build was paying for a census nothing
+# consulted.)
 
 # Whole-tree format census.  Only ever called on a path where the answer
 # changes what happens, because it is O(files) and the Unix path must not pay
@@ -202,23 +191,24 @@ tree_census() {
 }
 
 if [ "$IS_WINDOWS" = "unknown" ]; then
-  # No `stdenv` on the drv, so there is nothing to be authoritative about and
-  # the artefacts are all there is.  Say so loudly — a silent guess here is the
-  # shape of the bug this branch exists to remove — and refuse to guess when
-  # the tree genuinely contains both formats.
-  tree_census
-  echo "Phase 1c: the bundled derivation carries no stdenv, so the target could" \
-       "not be read from Nix; falling back to a format census of the output:" \
-       "$tree_pe_count PE file(s), $tree_unix_count ELF/Mach-O file(s)"
-  if [ "$tree_pe_count" -gt 0 ] && [ "$tree_unix_count" -gt 0 ]; then
-    echo "  ERROR: this output contains BOTH PE and ELF/Mach-O binaries, so the" >&2
-    echo "  census cannot tell a Windows bundle from a Unix bundle that ships a" >&2
-    echo "  PE as data.  Pass the target explicitly:" >&2
-    echo "      mkBundle { drv = ...; windowsTarget = true;  }   # or false" >&2
-    exit 1
-  fi
-  if [ "$tree_pe_count" -gt 0 ]; then IS_WINDOWS=1; else IS_WINDOWS=0; fi
-  echo "  -> IS_WINDOWS=$IS_WINDOWS"
+  # No `stdenv` on the drv (a bare `builtins.storePath`, a hand-rolled
+  # `derivation`) — mkBundle.nix documents both as supported shapes.
+  #
+  # DO NOT GUESS FROM THE ARTEFACTS. An earlier revision ran a format census
+  # here and inferred the target from it, which broke non-Windows builds three
+  # ways on inputs the base handled fine: a storePath tree holding both a PE
+  # and an ELF hard-errored where the base exited 0; a PE-only tree (the
+  # ordinary wine-wrapper shape) flipped a Linux build onto the PE path
+  # wholesale; and every stdenv-less build paid an O(files) `file -bL` walk it
+  # never used to.
+  #
+  # Unix is the correct default because it is what the base always did with
+  # these — a storePath bundle has never taken the PE path — so defaulting
+  # costs nothing and changes nothing. `windowsTarget` already exists for the
+  # caller who genuinely bundles a stdenv-less Windows tree, and an explicit
+  # answer beats a census that cannot distinguish "targets Windows" from
+  # "ships a .exe as data" anyway.
+  IS_WINDOWS=0
 elif [ "$IS_WINDOWS" = "1" ]; then
   echo "Phase 1c: target is Windows/PE (from the bundled derivation's stdenv)"
   # Nix says Windows and the output has no PE anywhere.  Do not proceed: every
@@ -232,26 +222,17 @@ elif [ "$IS_WINDOWS" = "1" ]; then
     exit 1
   fi
   echo "  Output census: $tree_pe_count PE file(s), $tree_unix_count ELF/Mach-O file(s)"
-else
-  # Unix target.  Nix is authoritative and a Linux package that ships a .exe as
-  # data is entirely legitimate, so this can only ever be a warning — a hard
-  # error here would be a new build breakage on valid input.  The narrow shape
-  # worth naming is a tree with PEs and NO native binaries at all, which is
-  # what a mis-wired cross build looks like.
-  if [ "$pe_exe_count" -gt 0 ] || [ "$pe_dll_count" -gt 0 ]; then
-    if [ "$unix_bin_count" -eq 0 ]; then
-      tree_census
-      if [ "$tree_unix_count" -eq 0 ]; then
-        echo "  WARNING: Nix says this derivation does NOT target Windows, yet the" >&2
-        echo "  output contains $tree_pe_count PE file(s) and no ELF/Mach-O binary" >&2
-        echo "  at all.  Proceeding on the Unix path, as Nix is authoritative." >&2
-        find "$out" -type f 2>/dev/null | while IFS= read -r f; do
-          case "$(file -bL "$f" 2>/dev/null)" in *PE32*) echo "    ${f#"$out"/}" >&2 ;; esac
-        done
-      fi
-    fi
-  fi
 fi
+# NOTE there is deliberately no `else` arm for the Unix target.
+#
+# An earlier revision warned when a non-Windows output contained PEs and no
+# native binary, on the theory that this is what a mis-wired cross build looks
+# like. It is also exactly what a wine wrapper looks like, which is a perfectly
+# ordinary package — so the warning fired on valid input, and it cost TWO
+# whole-tree `file -bL` walks to produce. Nix is authoritative about the target;
+# once it has answered, the artefacts have no further say and there is nothing
+# to check. Staying silent here is what keeps every non-Windows bundle
+# byte-identical to the base, output and logs included.
 
 # Where the Qt plugin and QML trees get staged inside the bundle.  "qt"
 # everywhere the bundler already worked; "qt-6" on Windows, which is the layout
