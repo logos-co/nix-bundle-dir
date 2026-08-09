@@ -1526,34 +1526,49 @@ if [ "$IS_WINDOWS" = "1" ]; then
   pe_resolve_app_dir
 fi
 if [ "$IS_WINDOWS" = "1" ] && [ -n "$pe_app_dir" ]; then
+  # The loop BREAKS at the first name-matching entry, so whatever it decides, it
+  # decides for the whole build.  An early `exit 1` on a non-PE therefore made a
+  # complete, working Qt app bundle fail because it also carried one inert file
+  # named Qt6Aaa.dll — and pass because the same file was named Qt6Zzz.dll and
+  # sorted after the real Qt6Core.dll.  Whether a valid bundle built came down
+  # to alphabetical position.  So: collect the impostors, keep looking, and let
+  # the answer depend on whether a real Qt was found.
+  qt_win_nonpe=""
   for f in "$out"/bin/Qt6*.dll "$out"/bin/Qt5*.dll; do
-    if [ -e "$f" ]; then
-      # `[ -e ]` deliberately, not `-f`: a DIRECTORY named like a Qt DLL has to
-      # keep counting as "something claims to be Qt here", because that is what
-      # it did before and because it is not a thing to pass over quietly.
-      #
-      # But a name is not a module.  A 28-byte TEXT file named Qt6Fake.dll used
-      # to set qt_detected and take the build down 100 lines later with "no Qt
-      # plugin directory ... was found in the closure" — pointing at the
-      # closure, which is innocent — while THE SAME BUILD had already logged
-      # "1 of 1 name-matching file(s) rejected as not-a-PE" one phase earlier.
-      # The classification was computed and not consulted.  Same exit code as
-      # before; the difference is that it now says what is actually wrong.
-      if [ -f "$f" ] && ! pe_is_pe "$f"; then
-        echo "  ERROR: bin/$(basename "$f") is named like a Qt library but is" >&2
-        echo "  not a PE, so it cannot be one.  Qt detection keys off this name," >&2
-        echo "  and every Qt staging decision below would be made on the strength" >&2
-        echo "  of a file that is not a module." >&2
-        exit 1
-      fi
-      qt_detected=1
-      qt_lib_name="$(basename "$f")"
-      if is_host_lib "$qt_lib_name"; then
-        qt_is_host=1
-      fi
-      break
+    [ -e "$f" ] || continue
+    # `[ -e ]`, not `-f`: a DIRECTORY named like a Qt DLL keeps counting as
+    # "something claims to be Qt here", because that is what it did before and
+    # because it is not a thing to pass over quietly.
+    if [ -f "$f" ] && ! pe_is_pe "$f"; then
+      qt_win_nonpe="$qt_win_nonpe $(basename "$f")"
+      continue
     fi
+    qt_detected=1
+    qt_lib_name="$(basename "$f")"
+    if is_host_lib "$qt_lib_name"; then
+      qt_is_host=1
+    fi
+    break
   done
+  if [ -n "$qt_win_nonpe" ]; then
+    if [ "$qt_detected" = "1" ]; then
+      # Harmless: a real Qt library was found regardless.  Said anyway, because
+      # a file named like a Qt DLL that is not one is worth knowing about.
+      echo "  Note: ignored name-matching non-PE file(s) in bin/:$qt_win_nonpe"
+    else
+      # A name is not a module.  This used to set qt_detected and take the build
+      # down 100 lines later with "no Qt plugin directory ... was found in the
+      # closure" — blaming the closure, which is innocent — while THE SAME BUILD
+      # had already logged "1 of 1 name-matching file(s) rejected as not-a-PE"
+      # one phase earlier.  Same exit code; it now says what is wrong.
+      echo "  ERROR: bin/ contains name-matching file(s) that are not PEs:" >&2
+      echo "     $qt_win_nonpe" >&2
+      echo "  and no real Qt library beside them.  Qt detection keys off these" >&2
+      echo "  names, so every Qt staging decision below would rest on a file" >&2
+      echo "  that is not a module." >&2
+      exit 1
+    fi
+  fi
 elif [ "$IS_WINDOWS" = "1" ]; then
   # No bin/: a module, not an app.  Qt cannot be in bin/ because there is none,
   # so this is the one shape where looking further is both necessary and free.
@@ -1573,37 +1588,37 @@ elif [ "$IS_WINDOWS" = "1" ]; then
   # reads as "no Qt libraries in this bundle" — the exact false statement this
   # arm exists to delete, reinstated by its own error path.  `$(...)` with
   # pipefail lets the failure be seen and said.
-  # PRUNED to where the sweep can actually stage.  "Anywhere in the tree"
-  # included the caller's extraDirs, which the sweep never writes to — so a
-  # module bundle carrying a real PE named Qt6Core.dll as inert data under
-  # assets/ raised the full three-line alarm over a bundle with no Qt in it.
-  # That is the same false positive just removed from the app arm by
-  # re-scoping it, and it does not get to survive here.
-  qt_find_args=( "$out" )
-  for dir in "${extra_dirs[@]+"${extra_dirs[@]}"}"; do
-    [ -n "$dir" ] || continue
-    qt_find_args+=( -path "$out/$dir" -prune -o )
-  done
-  qt_find_args+=( -type f \( -name 'Qt6*.dll' -o -name 'Qt5*.dll' \) -print )
   # Captured, not process-substituted: `done < <(find ...)` never checks the
   # producer's exit status, so a failing find yields an empty list that reads as
   # "no Qt libraries in this bundle" — the exact false statement this arm exists
   # to delete, reinstated through its own error path.  Labelled honestly: nix
   # canonicalises store permissions, so nobody has managed to make this find
   # fail; it is a guard against a future caller, not one that fires today.
-  qt_win_hits="$(find "${qt_find_args[@]}")" || {
+  # NOT pruned of extraDirs.  A previous revision pruned them on the premise
+  # that "the sweep never writes there", and that premise is false: pe_files
+  # enumerates roots with `find "$out" -type f` over the WHOLE tree, and on the
+  # module shape pe_sweep stages into `${app_dir:-$rootdir}` — the importer's
+  # own directory.  An importer inside an extraDir gets its dependencies staged
+  # into that extraDir, and the prune then hid exactly the Qt it was supposed to
+  # find.  It also matched the declared path literally, so `extraDirs = [
+  # "assets/" ]` pruned nothing while `[ "assets" ]` pruned everything.  The
+  # thing it was fixing was an informational line over a bundle that does
+  # contain a Qt DLL — which is what the line says.
+  qt_win_hits="$(find "$out" -type f \( -name 'Qt6*.dll' -o -name 'Qt5*.dll' \) | sort)" || {
     echo "  ERROR: could not scan $out for Qt libraries; refusing to report" >&2
     echo "  \"no Qt libraries in this bundle\" on the strength of a failed scan." >&2
     exit 1
   }
-  # TWO sorted passes, Qt6 then Qt5 — not one `sort` over everything.  The app
-  # arm's two sequential globs prefer Qt6, and a single sort does NOT reproduce
-  # that: "Qt5" sorts BEFORE "Qt6", so a bundle holding Qt5Compat.dll and
-  # Qt6Core.dll reported the Qt5 one where the app arm on the same content would
-  # name Qt6Core.dll.  The comment claiming otherwise was wrong about its own
-  # code.  Sorted within each pass so the answer does not depend on readdir
-  # order, which ext4 seeds per filesystem — measured: a bare find returns
-  # Qt6QuickControls2ImagineStyleImpl.dll where the glob returns Qt6Core.dll.
+  # TWO passes over the SORTED list, Qt6 then Qt5 — not one pass over one sort.
+  # Both halves are load-bearing and a previous revision had each without the
+  # other.  The sort kills readdir dependence (ext4 seeds htree order per
+  # filesystem; measured on the real Basecamp bundle, a bare find returns
+  # Qt6QuickControls2ImagineStyleImpl.dll where the glob returns Qt6Core.dll).
+  # The two passes reproduce the app arm's Qt6-before-Qt5 preference, which a
+  # single sort does NOT: "Qt5" sorts before "Qt6", so a bundle holding
+  # Qt5Compat.dll and Qt6Core.dll named the Qt5 one where the app arm on
+  # identical content names Qt6Core.dll.
+  qt_win_nonpe=""
   for qt_pass in 'Qt6' 'Qt5'; do
     if [ "$qt_module_shape" = "1" ]; then break; fi
     while IFS= read -r f; do
@@ -1612,7 +1627,10 @@ elif [ "$IS_WINDOWS" = "1" ]; then
       # `pe_is_pe`, not the name: the whole point is to stop making claims a
       # file does not support, and "Qt IS present in this bundle (Qt6Fake.dll)"
       # over a text file is the same false statement in the opposite direction.
-      pe_is_pe "$f" || continue
+      if ! pe_is_pe "$f"; then
+        qt_win_nonpe="$qt_win_nonpe ${f#"$out"/}"
+        continue
+      fi
       qt_module_shape=1
       # Relative path, not basename: lib/Qt6Core.dll and lib/vendor/Qt6Core.dll
       # read identically as a basename, and the location is the useful part.
@@ -1628,6 +1646,14 @@ elif [ "$IS_WINDOWS" = "1" ]; then
       break
     done <<< "$qt_win_hits"
   done
+  # Said, not swallowed.  `pe_is_pe || continue` here was the silent twin of the
+  # app arm's hard error: a module whose only Qt-named file is a text file
+  # logged "no Qt libraries in this bundle" one line after the same build logged
+  # "1 of 3 name-matching file(s) rejected as not-a-PE".  Identical input,
+  # opposite treatment, decided only by which arm it landed in.
+  if [ -n "$qt_win_nonpe" ]; then
+    echo "  Note: ignored name-matching non-PE file(s):$qt_win_nonpe"
+  fi
   # Deliberately NOT qt_detected: staging a plugin tree and writing qt.conf
   # would invent an app layout for something installed into someone else's
   # tree.  qt.conf, the platform plugin and the QML tree belong to the process
@@ -1645,15 +1671,19 @@ fi
 # Phase 6's whole Windows Qt contract unevaluated.  Malformed either way — but
 # trading a loud wrong answer for a quiet one is the trade this branch exists to
 # refuse.  So: say it, and stop.
-if [ "$IS_WINDOWS" = "1" ] && [ "$qt_detected" = "0" ] && [ -d "$out/lib" ]; then
-  for f in "$out"/lib/libQt*.so* "$out"/lib/libQt*.dylib; do
-    [ -e "$f" ] || continue
+# Over the WHOLE tree, like the module arm.  A depth-1 glob on $out/lib caught
+# lib/libQt6Core.so.6 and missed lib/vendor/libQt6Core.so.6 — the same silent
+# exit 0 this arm exists to refuse, one directory down.
+if [ "$IS_WINDOWS" = "1" ] && [ "$qt_detected" = "0" ]; then
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
     echo "  ERROR: this bundle targets Windows, but $(basename "$f") is a Qt" >&2
     echo "  library named for ELF or Mach-O.  A PE process cannot load it, and" >&2
     echo "  its presence means some input was built for the wrong target." >&2
     echo "  (A Windows Qt library is Qt6Core.dll — no lib prefix, .dll, in bin/.)" >&2
+    echo "      found at: ${f#"$out"/}" >&2
     exit 1
-  done
+  done <<< "$(find "$out" -type f \( -name 'libQt*.so*' -o -name 'libQt*.dylib' \) | sort)"
 fi
 # The framework arm's Windows guard is DEFENSIVE, not a fix: framework_map is
 # populated only by trace_deps, which a Windows target never calls (the PE
@@ -1923,12 +1953,26 @@ elif [ "$IS_WINDOWS" = "1" ]; then
   # extra line there is a real (if small) change to a log this branch is
   # otherwise required to leave byte-identical.
   if [ "$qt_module_shape" = "1" ]; then
-    echo "Phase 2b: Qt IS present in this bundle ($qt_lib_name), but the output" \
-         "has no application directory — it is a module, not an app."
-    echo "  qt.conf, the platform plugin and the QML tree belong to the process" \
-         "that loads this module, so they are NOT staged and NOT checked here."
-    echo "  If this output was meant to be an application, its bin/ is missing" \
-         "and the Qt runtime contract has gone unverified."
+    # qt_is_host is CONSULTED here, which is the whole point of computing it on
+    # the module arm.  A previous revision set it and never read it — every
+    # other reader is conjoined with `qt_detected=1`, which the module arm
+    # deliberately never sets — so a module whose Qt is host-provided was still
+    # told "Qt IS present in this bundle", the exact claim the assignment was
+    # added to stop making.  Written and not consulted is the same defect this
+    # file keeps finding elsewhere.
+    if [ "$qt_is_host" = "1" ]; then
+      echo "Phase 2b: the Qt named in this bundle ($qt_lib_name) is HOST-PROVIDED," \
+           "so it is not this bundle's to carry."
+      echo "  This output has no application directory either — it is a module," \
+           "not an app — so no Qt staging would apply in any case."
+    else
+      echo "Phase 2b: Qt IS present in this bundle ($qt_lib_name), but the output" \
+           "has no application directory — it is a module, not an app."
+      echo "  qt.conf, the platform plugin and the QML tree belong to the process" \
+           "that loads this module, so they are NOT staged and NOT checked here."
+      echo "  If this output was meant to be an application, its bin/ is missing" \
+           "and the Qt runtime contract has gone unverified."
+    fi
   else
     echo "Phase 2b: Skipping Qt plugin/QML bundling (no Qt libraries in this bundle)"
   fi
