@@ -3297,8 +3297,19 @@ fi
 test_dir="$(mktemp -d)"
 [ -d "$out/bin" ] && cp -a "$out/bin" "$test_dir/bin"
 [ -d "$out/lib" ] && cp -a "$out/lib" "$test_dir/lib"
+# `mkdir -p` on the PARENT, because an extraDirs entry is a path, not a name:
+# `share/assets` has to land at `$test_dir/share/assets`, and `cp` will not
+# invent the `share/` above it.  Phase 1's copy into `$out` always did this
+# (`mkdir -p "$out/$dir"`); this loop did not, so any entry containing a slash
+# killed the build here — under `set -e`, with cp's bare error as the only
+# output.  No ERROR line, no phase attribution, and Phase 6 is the one phase
+# whose failures are supposed to be legible.  Flat entries never hit it, which
+# is why it survived: `bin` and `lib` above have no parent to create either.
 for dir in "${extra_dirs[@]+"${extra_dirs[@]}"}"; do
-  [ -d "$out/$dir" ] && cp -a "$out/$dir" "$test_dir/$dir"
+  if [ -d "$out/$dir" ]; then
+    mkdir -p "$(dirname "$test_dir/$dir")"
+    cp -a "$out/$dir" "$test_dir/$dir"
+  fi
 done
 
 errors=0
