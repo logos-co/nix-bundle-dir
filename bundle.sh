@@ -827,6 +827,32 @@ declare -A pe_unresolved
 pe_staged_total=0
 pe_mirrored_total=0
 
+# WHERE staged DLLs go, resolved ONCE and readable from every phase that has to
+# NAME that destination.  Phase 1 has run by the time the first sweep does, so
+# bin/ either exists or never will.
+#
+# It is a global and not just pe_sweep's local because four later messages spell
+# the destination out ("staged into bin/", "resolved from bin/", ...) and every
+# one of them was unconditional: on a module-only output, which has no bin/ and
+# stages beside the importer, they each pointed the reader at a directory that
+# is not in the bundle.  That is the same defect as naming bin/ in the
+# unresolved-import error, and one fix should cover all of them.
+pe_app_dir=""
+pe_app_dir_resolved=""
+pe_stage_label="bin/"
+pe_resolve_app_dir() {
+  [ -n "$pe_app_dir_resolved" ] && return 0
+  pe_app_dir_resolved=1
+  if [ -d "$out/bin" ]; then
+    pe_app_dir="$out/bin"
+    pe_stage_label="bin/"
+  else
+    pe_app_dir=""
+    pe_stage_label="each importer's own directory"
+  fi
+  return 0
+}
+
 # Walk the import tables of every root, stage what is missing into bin/, and
 # REPEAT until a round adds nothing.
 #
@@ -861,10 +887,10 @@ pe_sweep() {
   # directory that IS searched for a plugin loaded with
   # LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR (which logos-module sets) is the plugin's
   # own, so that is where they go.
-  app_dir=""
-  if [ -d "$out/bin" ]; then
-    app_dir="$out/bin"
-    pe_dir_index "$out/bin"
+  pe_resolve_app_dir
+  app_dir="$pe_app_dir"
+  if [ -n "$app_dir" ]; then
+    pe_dir_index "$app_dir"
   else
     echo "    (no bin/ in this output: staging beside each importer, which is the" \
          "only directory Windows searches for a module loaded from it)"
@@ -907,6 +933,21 @@ pe_sweep() {
           # the only one there is.
           if [ -n "$app_dir" ] && [ "$rootdir" != "$app_dir" ]; then
             beside_name="${pe_dir_have["$rootdir|$key"]}"
+            # The same explicit check the staging path makes, for the same
+            # reason and with the same wording.  Without it a DIRECTORY named
+            # like the import at $app_dir/<name> makes `cp -L` succeed *into*
+            # it, and the failure surfaces only as the generic post-condition
+            # below — which fails closed, but names the copy rather than the
+            # directory that caused it.  Only the staging path had this, so the
+            # two halves of the same decision reported the same situation
+            # differently depending on which one hit it first.
+            if [ -d "$app_dir/$beside_name" ]; then
+              echo "  ERROR: cannot mirror $beside_name into ${app_dir#$out/}: a" >&2
+              echo "  DIRECTORY of that name is already there.  A directory cannot" >&2
+              echo "  satisfy an import, and overwriting it is not something this" >&2
+              echo "  script should guess at." >&2
+              exit 1
+            fi
             cp -L "$rootdir/$beside_name" "$app_dir/$beside_name" || {
               echo "  ERROR: could not mirror $beside_name from ${rootdir#$out/}" \
                    "into ${app_dir#$out/}" >&2
@@ -1041,8 +1082,15 @@ pe_sweep() {
   # Round 1 finding nothing means either a perfect bundle or a broken reader.
   # pe_reader_control has already ruled out the second, before any sweep ran,
   # so a zero here is a fact about the input.  Say what happened either way.
-  echo "  DLL closure sweep ($label) converged after $round round(s);" \
-       "$pe_staged_total DLL(s) staged, $pe_mirrored_total mirrored into bin/, so far"
+  if [ -n "$pe_app_dir" ]; then
+    echo "  DLL closure sweep ($label) converged after $round round(s);" \
+         "$pe_staged_total DLL(s) staged, $pe_mirrored_total mirrored into bin/, so far"
+  else
+    # No bin/, so mirroring is structurally impossible and its count would only
+    # read as "nothing needed mirroring" rather than "there was nowhere to".
+    echo "  DLL closure sweep ($label) converged after $round round(s);" \
+         "$pe_staged_total DLL(s) staged beside their importers, so far"
+  fi
   # Every staging decision this sweep just made was made from import tables.
   # If the reader could not read one of them, those decisions were made from an
   # empty list that meant "unreadable", not "satisfied" — so fail here, at the
@@ -1765,10 +1813,10 @@ if [ "$IS_WINDOWS" = "1" ]; then
   # ran — so a zero here is a fact about the bundle.
   if [ "$pe_staged_total" -eq 0 ]; then
     echo "  DLL closure complete: nothing needed staging — every import was" \
-         "already satisfied from bin/, from the importer's own directory, or by" \
-         "a Windows system DLL."
+         "already satisfied from $pe_stage_label, from the importer's own" \
+         "directory, or by a Windows system DLL."
   else
-    echo "  DLL closure complete: $pe_staged_total DLL(s) staged into bin/"
+    echo "  DLL closure complete: $pe_staged_total DLL(s) staged into $pe_stage_label"
   fi
   if [ -e "$out/bin/Qt6WebEngineCore.dll" ]; then
     echo "  WARNING: Qt6WebEngineCore.dll is in this bundle, but Phase 2d's" >&2
@@ -2021,7 +2069,8 @@ macos_system_lib_path() {
 if [ "$IS_WINDOWS" = "1" ]; then
 
   echo "  Skipped: a PE has no rpaths, no install names and no interpreter."
-  echo "  Its imports are base names resolved from bin/, which Phase 2e filled."
+  pe_resolve_app_dir
+  echo "  Its imports are base names resolved from $pe_stage_label, which Phase 2e filled."
 
 elif [ "$IS_DARWIN" = "1" ]; then
 
