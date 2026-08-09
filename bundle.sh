@@ -269,12 +269,12 @@ if [ "$IS_WINDOWS" = "1" ]; then
   echo "  bin/ entry count: source $src_bin_entries -> bundle $out_bin_entries" \
        "($out_bin_links symlink(s) remaining)"
   if [ "$out_bin_entries" -lt "$src_bin_entries" ]; then
-    echo "  ERROR: bin/ lost entries in Phase 1 ($src_bin_entries -> $out_bin_entries)"
+    echo "  ERROR: bin/ lost entries in Phase 1 ($src_bin_entries -> $out_bin_entries)" >&2
     exit 1
   fi
   if [ "$out_bin_links" -gt 0 ]; then
-    echo "  ERROR: bin/ still contains $out_bin_links symlink(s); they will dangle"
-    find "$out/bin" -maxdepth 1 -mindepth 1 -type l -printf '    %f -> %l\n'
+    echo "  ERROR: bin/ still contains $out_bin_links symlink(s); they will dangle" >&2
+    find "$out/bin" -maxdepth 1 -mindepth 1 -type l -printf '    %f -> %l\n' >&2
     exit 1
   fi
 fi
@@ -376,25 +376,82 @@ pe_is_pe() {
 # ERROR_BAD_EXE_FORMAT at load time, i.e. the same silent pre-main() death this
 # branch exists to convert into a build error.
 #
-# No new read and no new tool: pe_is_pe already stores the whole `file -bL`
-# string for every PE it classifies, and that string names the machine
-# ("PE32+ executable (DLL) (console) x86-64", "PE32 executable (console) Intel
-# 80386", "PE32+ executable (DLL) (console) Aarch64").  This just reads it back.
+# Read from the FILE FORMAT, not from `file`'s prose.  An earlier version of
+# this function pattern-matched the `file -bL` string pe_is_pe already caches,
+# which cost no extra read and looked free.  It is not free: `file` describes an
+# i686 PE as "Intel 80386" up to 5.45 and "Intel i386" from 5.46, so the x86 arm
+# stopped matching on a `file` bump, fell through to `unknown`, and BOTH call
+# sites treated unknown as "carry on".  Measured: with nixpkgs' own file-5.48 in
+# place of the pinned 5.45, and nothing else changed, a bundle shipping an i686
+# DLL beside an x86-64 exe built green.  A machine check whose correctness
+# depends on an unpinned tool's wording is not a machine check.
 #
-# Aarch64 is matched BEFORE the generic ARM arm, because the Aarch64 spelling
-# contains no "ARM" but some `file` builds spell it "ARM64"; putting the narrow
-# case first is what keeps a 64-bit ARM PE from being reported as 32-bit ARM.
+# IMAGE_DOS_HEADER.e_lfanew (4 bytes LE at 0x3C) points at the PE signature;
+# IMAGE_FILE_HEADER.Machine is the 2 LE bytes just past it.  Composed from
+# single bytes on purpose — `od -tu4`/`-tx2` decode in the BUILD HOST's byte
+# order, which is only accidentally right on the hosts we happen to use.
+#
+# Unrecognised is FATAL at both call sites, not a note: every PE has a Machine
+# field, so "I could not tell" means the reader or the file is wrong, and the
+# failure this check exists to catch (ERROR_BAD_EXE_FORMAT before main(), no
+# output) is exactly the one a soft fallback lets through.
+declare -A pe_arch_cache
 pe_arch() {
-  local f="$1" ft
+  local f="$1" bytes lfanew mach
   if ! pe_is_pe "$f"; then printf 'not-pe\n'; return 0; fi
-  ft="${pe_filetype_cache["$f"]:-}"
-  case "$ft" in
-    *Aarch64*|*aarch64*|*ARM64*|*AArch64*) printf 'arm64\n' ;;
-    *x86-64*|*x86_64*)                     printf 'x86-64\n' ;;
-    *"Intel 80386"*|*80386*)               printf 'x86\n' ;;
-    *ARM*|*Armv7*)                         printf 'arm\n' ;;
-    *)                                     printf 'unknown\n' ;;
+  # Memoised for the same reason pe_is_pe is: Phase 6 asks for the architecture
+  # of an importer and of a provider once per import name, ~2300 times on a
+  # Basecamp bundle, and each answer is two `od` spawns.
+  if [ -n "${pe_arch_cache["$f"]:-}" ]; then
+    printf '%s\n' "${pe_arch_cache["$f"]}"
+    return 0
+  fi
+  mach=""
+  # shellcheck disable=SC2207
+  bytes=($(od -An -tu1 -j60 -N4 -- "$f" 2>/dev/null)) || bytes=()
+  if [ "${#bytes[@]}" -eq 4 ]; then
+    lfanew=$(( bytes[0] + (bytes[1] << 8) + (bytes[2] << 16) + (bytes[3] << 24) ))
+    if [ "$lfanew" -gt 0 ]; then
+      # shellcheck disable=SC2207
+      bytes=($(od -An -tu1 -j"$lfanew" -N6 -- "$f" 2>/dev/null)) || bytes=()
+      # "PE\0\0" — refuse to read a Machine field out of a header that is not
+      # there rather than reporting whatever those two bytes happen to be.
+      if [ "${#bytes[@]}" -eq 6 ] && [ "${bytes[0]}" -eq 80 ] && [ "${bytes[1]}" -eq 69 ] \
+         && [ "${bytes[2]}" -eq 0 ] && [ "${bytes[3]}" -eq 0 ]; then
+        mach="$(printf '%04x' $(( bytes[4] + (bytes[5] << 8) )))"
+      fi
+    fi
+  fi
+  case "$mach" in
+    8664) mach=x86-64 ;;
+    014c) mach=x86 ;;
+    aa64) mach=arm64 ;;
+    01c0|01c4) mach=arm ;;
+    "")   mach=unknown ;;
+    *)    mach="machine-0x$mach" ;;
   esac
+  pe_arch_cache["$f"]="$mach"
+  printf '%s\n' "$mach"
+}
+
+# One place decides what an unusable architecture answer means, so the sweep and
+# Phase 6 cannot drift apart on it again.  `not-pe` is included: both callers
+# have already established their argument is a PE, so it can only mean the file
+# changed underneath us.
+pe_arch_or_die() {
+  local f="$1" what="$2" a
+  a="$(pe_arch "$f")"
+  case "$a" in
+    x86-64|x86|arm64|arm) printf '%s\n' "$a"; return 0 ;;
+  esac
+  echo "  ERROR: cannot determine the machine of $what:" >&2
+  echo "      $f" >&2
+  echo "  read it as '$a'.  Every PE carries IMAGE_FILE_HEADER.Machine, so this" >&2
+  echo "  is a truncated or non-PE file, or an architecture this bundler has" >&2
+  echo "  never been taught.  Windows answers a wrong-machine DLL with" >&2
+  echo "  ERROR_BAD_EXE_FORMAT before main() runs and prints nothing, so this" >&2
+  echo "  is not something to carry on past." >&2
+  exit 1
 }
 
 # --- does this bundle render QML? -------------------------------------------
@@ -781,9 +838,37 @@ pe_mirrored_total=0
 pe_sweep() {
   local label="$1"
   local round=0 added root rootdir imp key src dest roots_seen beside_name
-  local dest_name root_arch src_arch
+  local dest_name root_arch src_arch app_dir stage_dir
   echo "  DLL closure sweep ($label):"
-  pe_dir_index "$out/bin"
+  # WHERE a missing DLL goes.  bin/ is the application's own directory, which
+  # Windows searches for every module in the process, so for an app bundle it is
+  # the one destination that always works — and that is what this swept into,
+  # unconditionally.
+  #
+  # But nothing on this path ever CREATED bin/: Phase 1 makes it only when the
+  # derivation has one.  A Windows output with no bin/ at all is a shape this
+  # workspace really produces — a Logos module is `lib/<name>_plugin.dll` and
+  # nothing else — and for those the first `cp` into the missing directory ended
+  # the build on a bare `cp: ... No such file or directory`, no ERROR line, no
+  # phase name, under `set -e`, which also pre-empted the post-condition below
+  # that was supposed to attribute exactly this.
+  #
+  # `mkdir -p "$out/bin"` would make it exit 0 and be WRONG: a module is
+  # installed into someone else's tree (lgpm puts it in `modules/<name>/`), so a
+  # bin/ invented here is a directory Windows never searches for that plugin,
+  # and the DLLs would be shipped where they cannot be found — green build, dead
+  # module, which is the whole defect class this branch exists to close.  The
+  # directory that IS searched for a plugin loaded with
+  # LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR (which logos-module sets) is the plugin's
+  # own, so that is where they go.
+  app_dir=""
+  if [ -d "$out/bin" ]; then
+    app_dir="$out/bin"
+    pe_dir_index "$out/bin"
+  else
+    echo "    (no bin/ in this output: staging beside each importer, which is the" \
+         "only directory Windows searches for a module loaded from it)"
+  fi
   while :; do
     round=$((round + 1))
     added=0
@@ -796,9 +881,14 @@ pe_sweep() {
         [ -n "$imp" ] || continue
         is_windows_system_dll "$imp" && continue
         key="${imp,,}"
+        stage_dir="${app_dir:-$rootdir}"
         # bin/ first: that is the executable's own directory, which Windows
-        # always searches, for every module in the process.
-        [ -n "${pe_dir_have["$out/bin|$key"]:-}" ] && continue
+        # always searches, for every module in the process.  With no bin/ there
+        # is no such directory and the importer's own is the only candidate,
+        # which the beside-the-importer test below already covers.
+        if [ -n "$app_dir" ]; then
+          [ -n "${pe_dir_have["$app_dir|$key"]:-}" ] && continue
+        fi
         # "Sits beside the importer" satisfies the CHECK, but it is not a
         # guarantee the bundler can make: the loader only searches the
         # importing MODULE's directory when that module was loaded with
@@ -812,23 +902,30 @@ pe_sweep() {
         # returned — and it converts an assumption about a loader flag into a
         # file that is simply there.
         if [ -n "${pe_dir_have["$rootdir|$key"]:-}" ]; then
-          if [ "$rootdir" != "$out/bin" ]; then
+          # With no app dir there is nowhere to mirror TO, and nothing to gain:
+          # beside-the-importer is not a weaker guarantee than bin/ here, it is
+          # the only one there is.
+          if [ -n "$app_dir" ] && [ "$rootdir" != "$app_dir" ]; then
             beside_name="${pe_dir_have["$rootdir|$key"]}"
-            cp -L "$rootdir/$beside_name" "$out/bin/$beside_name"
-            chmod u+w "$out/bin/$beside_name" 2>/dev/null || true
-            unset 'pe_filetype_cache[$out/bin/$beside_name]'
+            cp -L "$rootdir/$beside_name" "$app_dir/$beside_name" || {
+              echo "  ERROR: could not mirror $beside_name from ${rootdir#$out/}" \
+                   "into ${app_dir#$out/}" >&2
+              exit 1
+            }
+            chmod u+w "$app_dir/$beside_name" 2>/dev/null || true
+            unset 'pe_filetype_cache[$app_dir/$beside_name]'
             # Post-condition, as the staging path below already has. This
             # branch used to copy and record with no check at all, so a failed
             # or truncated copy still marked the import satisfied. `pe_is_pe`
             # is included for the same reason it is below: what gets RECORDED
             # as satisfying an import has to be a loadable module, not a file
             # with the right name.
-            if [ -L "$out/bin/$beside_name" ] || [ ! -s "$out/bin/$beside_name" ] \
-               || ! pe_is_pe "$out/bin/$beside_name"; then
+            if [ -L "$app_dir/$beside_name" ] || [ ! -s "$app_dir/$beside_name" ] \
+               || ! pe_is_pe "$app_dir/$beside_name"; then
               echo "  ERROR: mirroring $beside_name from ${rootdir#$out/} produced no usable file" >&2
               exit 1
             fi
-            pe_dir_have["$out/bin|$key"]="$beside_name"
+            pe_dir_have["$app_dir|$key"]="$beside_name"
             pe_mirrored_total=$((pe_mirrored_total + 1))
             added=$((added + 1))
             echo "    round $round  ~ $beside_name  mirrored into bin/ from" \
@@ -848,12 +945,9 @@ pe_sweep() {
         # DLL with ERROR_BAD_EXE_FORMAT at load time — again before main(),
         # again with no output.  Fatal, not a warning: there is no reading of
         # "the app is 64-bit and its dependency is 32-bit" that ships.
-        root_arch="$(pe_arch "$root")"
-        src_arch="$(pe_arch "$src")"
-        if [ "$root_arch" = unknown ] || [ "$src_arch" = unknown ]; then
-          echo "    Note: cannot compare architectures for $imp" \
-               "(importer=$root_arch provider=$src_arch); staging it unchecked"
-        elif [ "$root_arch" != "$src_arch" ]; then
+        root_arch="$(pe_arch_or_die "$root" "the PE importing $imp")"
+        src_arch="$(pe_arch_or_die "$src" "the closure's provider of $imp")"
+        if [ "$root_arch" != "$src_arch" ]; then
           echo "  ERROR: ${root#$out/} is $root_arch but the only provider of" >&2
           echo "  $imp in the closure is $src_arch:" >&2
           echo "      $src" >&2
@@ -875,17 +969,28 @@ pe_sweep() {
         # KERNEL32.dll.  Windows itself is case-insensitive, so the provider's
         # own spelling satisfies the import either way.
         dest_name="$(basename "$src")"
-        dest="$out/bin/$dest_name"
+        dest="$stage_dir/$dest_name"
         if [ -d "$dest" ]; then
-          echo "  ERROR: cannot stage $dest_name into bin/: a DIRECTORY of that" >&2
-          echo "  name is already there.  A directory cannot satisfy an import," >&2
-          echo "  and overwriting it is not something this script should guess at." >&2
+          echo "  ERROR: cannot stage $dest_name into ${stage_dir#$out/}: a" >&2
+          echo "  DIRECTORY of that name is already there.  A directory cannot" >&2
+          echo "  satisfy an import, and overwriting it is not something this" >&2
+          echo "  script should guess at." >&2
           exit 1
         fi
         # cp -L, never cp -a: the closure entry is very often win-dll-link.sh's
         # RELATIVE symlink into another store path, and copying it as a symlink
         # stages a link that dangles the instant the bundle is moved.
-        cp -L "$src" "$dest"
+        #
+        # Attributed, because `set -e` makes an unchecked `cp` end the build on
+        # cp's own one-line message with no ERROR and no phase — and it does so
+        # BEFORE the post-condition three lines down, so the guard that exists
+        # to explain this failure could never see the commonest way it happens.
+        cp -L "$src" "$dest" || {
+          echo "  ERROR: could not stage $dest_name into ${stage_dir#$out/} for" >&2
+          echo "  ${root#$out/}, which imports $imp.  Source:" >&2
+          echo "      $src" >&2
+          exit 1
+        }
         chmod u+w "$dest" 2>/dev/null || true
         # The path just changed on disk, so drop any classification cached for
         # it before asking what it now is.
@@ -898,7 +1003,7 @@ pe_sweep() {
           echo "  ERROR: staging $imp from $src produced no usable PE at $dest" >&2
           exit 1
         fi
-        pe_dir_have["$out/bin|$key"]="$dest_name"
+        pe_dir_have["$stage_dir|$key"]="$dest_name"
         added=$((added + 1))
         pe_staged_total=$((pe_staged_total + 1))
         if [ "$dest_name" = "$imp" ]; then
@@ -2610,6 +2715,11 @@ if [ "$IS_WINDOWS" = "1" ]; then
   win_import_names=0
   win_arch_checked=0
   win_archs=""
+  # Only mention bin/ in the unresolved-import error when there IS one; a
+  # module-only output has none, and naming a directory that does not exist
+  # sends the reader looking for a staging bug that is not there.
+  app_present=""
+  [ -d "$out/bin" ] && app_present=1
   # Same enumeration the sweep used — pe_files — so the fixer and the checker
   # cannot disagree about what a root is.  That asymmetry was a build failure
   # on valid input, twice.
@@ -2618,7 +2728,7 @@ if [ "$IS_WINDOWS" = "1" ]; then
     fdir="$(dirname "$f")"
     pe_dir_index "$fdir"
     pe_dir_index "$out/bin"
-    f_arch="$(pe_arch "$f")"
+    f_arch="$(pe_arch_or_die "$f" "a PE in this bundle")"
     case " $win_archs " in *" $f_arch "*) ;; *) win_archs="$win_archs $f_arch" ;; esac
     while IFS= read -r imp; do
       [ -n "$imp" ] || continue
@@ -2636,16 +2746,13 @@ if [ "$IS_WINDOWS" = "1" ]; then
         hit="$out/bin/${pe_dir_have["$out/bin|$key"]}"
       fi
       if [ -z "$hit" ]; then
-        echo "  ERROR: ${f#"$out"/} imports $imp, which is in neither bin/ nor its" \
-             "own directory" >&2
+        echo "  ERROR: ${f#"$out"/} imports $imp, which is in neither its own" \
+             "directory nor${app_present:+ bin/ nor} the closure" >&2
         win_errors=$((win_errors + 1))
         continue
       fi
-      hit_arch="$(pe_arch "$hit")"
-      if [ "$f_arch" = unknown ] || [ "$hit_arch" = unknown ]; then
-        echo "  Note: architectures not comparable for $imp" \
-             "(${f#"$out"/}=$f_arch, provider=$hit_arch)"
-      elif [ "$f_arch" != "$hit_arch" ]; then
+      hit_arch="$(pe_arch_or_die "$hit" "the $imp satisfying ${f#"$out"/}")"
+      if [ "$f_arch" != "$hit_arch" ]; then
         echo "  ERROR: ${f#"$out"/} is $f_arch but the $imp that satisfies it" \
              "(${hit#"$out"/}) is $hit_arch; Windows rejects that with" \
              "ERROR_BAD_EXE_FORMAT at load time" >&2
@@ -2658,6 +2765,28 @@ if [ "$IS_WINDOWS" = "1" ]; then
   echo "  Checked $win_pe_files PE file(s), $win_import_names import name(s)"
   echo "  Machine check: $win_arch_checked resolved import(s) matched their" \
        "importer's architecture; architectures present in this bundle:${win_archs:- none}"
+  # ...and now COMPARE it, rather than printing a number nobody reads.
+  # `win_arch_checked` on its own cannot carry the signal: a bundle whose every
+  # non-system import is satisfied out of bin/ by a same-machine provider counts
+  # them, but so does a bundle with no non-system imports at all — both print 0
+  # legitimately, so there is no baseline a degraded 0 could look wrong against.
+  # The architecture SET is the number with a defensible expectation: everything
+  # here comes out of one cross target, so a bundle carrying two machines means
+  # a wrong-target input reached the closure.  Windows would only say so at load
+  # time, before main(), with no output.
+  #
+  # A policy choice, not a law — a bundle deliberately shipping a 32-bit helper
+  # beside a 64-bit app is a legitimate thing that this rejects.  No such bundle
+  # exists in this workspace; when one does, this is the line to revisit.
+  win_arch_count="$(printf '%s\n' $win_archs | grep -c . || true)"
+  if [ "${win_arch_count:-0}" -gt 1 ]; then
+    echo "  ERROR: this bundle carries PEs for more than one machine:$win_archs" >&2
+    echo "  Everything in a cross bundle comes from a single target, so a second" >&2
+    echo "  architecture means an input built for the wrong one reached the" >&2
+    echo "  closure.  Windows reports that as ERROR_BAD_EXE_FORMAT at load time," >&2
+    echo "  before main() runs and with nothing printed." >&2
+    win_errors=$((win_errors + 1))
+  fi
   pe_report_zero_import_files
   # And re-adjudicate the reader itself over this whole pass: this loop just
   # re-read every import table in the bundle, so anything it could not read is
