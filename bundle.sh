@@ -955,6 +955,15 @@ pe_sweep() {
             }
             chmod u+w "$app_dir/$beside_name" 2>/dev/null || true
             unset 'pe_filetype_cache[$app_dir/$beside_name]'
+            # Belt and braces, and honestly labelled: the analysis says this
+            # cannot currently fire, because a destination that already holds a
+            # PE short-circuits above (pe_dir_index records every real PE in the
+            # directory), so the only paths that CAN be overwritten hold
+            # non-PEs, and pe_arch returns not-pe without ever caching those.
+            # A build with both unsets deleted is byte-identical in tree and
+            # log. Kept because the reasoning rests on pe_dir_index staying
+            # exhaustive, and a stale architecture is not a failure that
+            # announces itself.
             unset 'pe_arch_cache[$app_dir/$beside_name]'
             # Post-condition, as the staging path below already has. This
             # branch used to copy and record with no check at all, so a failed
@@ -1037,6 +1046,7 @@ pe_sweep() {
         # The path just changed on disk, so drop any classification cached for
         # it before asking what it now is.
         unset 'pe_filetype_cache[$dest]'
+        # Same reasoning as the mirror branch above.
         unset 'pe_arch_cache[$dest]'
         # `pe_is_pe` is part of the post-condition, not decoration: the whole
         # point of checking the provider was that a name is not a module, and a
@@ -1495,30 +1505,83 @@ qt_is_host=0
 # "no Qt libraries in this bundle" and exited 0 with the whole Windows Qt
 # contract in Phase 6 never evaluated.  Look wherever the sweep is allowed to
 # put things, which is anywhere in the tree, rather than at one directory.
+# The widening is confined to the shape that needs it.  A first attempt looked
+# for Qt anywhere in the tree on BOTH shapes, and that was wrong in three
+# measured ways, all of them on the APP shape where nothing was broken:
+#   * an app bundle carrying an unrelated PE named Qt6Core.dll in lib/ went from
+#     a green build to a HARD FAILURE ("Qt was detected in bin/ but no Qt plugin
+#     directory ... was found"), because the app arm keyed off "is there a bin/"
+#     and never off WHERE the hit was;
+#   * a 28-byte TEXT file named Qt6Core.dll did the same — and the same build had
+#     already logged "1 of 1 name-matching file(s) rejected as not-a-PE" one
+#     phase earlier, so the script knew and the gate took the NAME as proof;
+#   * `-type f` also SHRANK detection at the other end: `bin/Qt6Core.dll` as a
+#     DIRECTORY used to be fatal (the old test was `[ -e ]`) and became a silent
+#     "no Qt libraries in this bundle".
+# When there IS a bin/, the sweep stages into it and nowhere else, so widening
+# buys nothing and costs all of that.  The app arm below is therefore byte-for-
+# byte the one that shipped.
 qt_module_shape=0
 if [ "$IS_WINDOWS" = "1" ]; then
   pe_resolve_app_dir
-  qt_win_hit="$(find "$out" -type f \( -name 'Qt6*.dll' -o -name 'Qt5*.dll' \) -print -quit 2>/dev/null || true)"
-  if [ -n "$qt_win_hit" ]; then
-    qt_lib_name="$(basename "$qt_win_hit")"
-    if [ -n "$pe_app_dir" ]; then
+fi
+if [ "$IS_WINDOWS" = "1" ] && [ -n "$pe_app_dir" ]; then
+  for f in "$out"/bin/Qt6*.dll "$out"/bin/Qt5*.dll; do
+    if [ -e "$f" ]; then
       qt_detected=1
+      qt_lib_name="$(basename "$f")"
       if is_host_lib "$qt_lib_name"; then
         qt_is_host=1
       fi
-    else
-      # Qt IS here, and this output is a module rather than an application.
-      # Staging a plugin tree and writing qt.conf would be inventing an app
-      # layout for something that gets installed into someone else's tree —
-      # qt.conf, the platform plugin and the QML tree belong to the process
-      # that loads this module, not to the module.  So do not pretend to check
-      # a contract this output does not own; say so, loudly, instead of
-      # reporting "no Qt libraries in this bundle", which was false.
-      qt_module_shape=1
+      break
     fi
-  fi
+  done
+elif [ "$IS_WINDOWS" = "1" ]; then
+  # No bin/: a module, not an app.  Qt cannot be in bin/ because there is none,
+  # so this is the one shape where looking further is both necessary and free.
+  #
+  # `pe_is_pe`, not the name: the whole point is to stop making claims a file
+  # does not support, and "Qt IS present in this bundle (Qt6Fake.dll)" over a
+  # text file is the same false statement in the opposite direction.
+  # `sort`, not readdir order.  The app arm above uses two sequential SORTED
+  # globs, so it is deterministic and prefers Qt6 over Qt5; a bare `find` picks
+  # whatever the filesystem yields first.  Measured on the real Basecamp bundle:
+  # find returns Qt6QuickControls2ImagineStyleImpl.dll where the glob returns
+  # Qt6Core.dll, and ext4 htree order is seeded per filesystem, so the same
+  # bundle can answer differently on a different builder.
+  #
+  # And captured, not process-substituted.  `done < <(find ...)` never checks
+  # the producer's exit status, so a find that fails yields an empty list that
+  # reads as "no Qt libraries in this bundle" — the exact false statement this
+  # arm exists to delete, reinstated by its own error path.  `$(...)` with
+  # pipefail lets the failure be seen and said.
+  qt_win_hits="$(find "$out" -type f \( -name 'Qt6*.dll' -o -name 'Qt5*.dll' \) | sort)" || {
+    echo "  ERROR: could not scan $out for Qt libraries; refusing to report" >&2
+    echo "  \"no Qt libraries in this bundle\" on the strength of a failed scan." >&2
+    exit 1
+  }
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    pe_is_pe "$f" || continue
+    qt_module_shape=1
+    # Relative path, not basename: lib/Qt6Core.dll and lib/vendor/Qt6Core.dll
+    # read identically as a basename, and on this arm the name is printed
+    # rather than fed to is_host_lib, so the location is the useful part.
+    qt_lib_name="${f#"$out"/}"
+    break
+  done <<< "$qt_win_hits"
+  # Deliberately NOT qt_detected: staging a plugin tree and writing qt.conf
+  # would invent an app layout for something installed into someone else's
+  # tree.  qt.conf, the platform plugin and the QML tree belong to the process
+  # that LOADS this module.  What was wrong before was the claim, not the skip.
 fi
-if [ "$qt_detected" = "0" ] && [ "$framework_count" -gt 0 ]; then
+# Both arms below are gated off Windows.  A Windows bundle reaching them means
+# a Mach-O framework or an ELF `libQt*.so*` in a PE tree, i.e. an input that is
+# already wrong — and the consequence was not a warning but a takeover: on the
+# module shape the flat arm set qt_detected=1, only qt_detected is honoured
+# downstream, so the module-shape statement was silently dropped and the
+# app-shaped Qt path ran against a bundle that has no bin/ to write qt.conf to.
+if [ "$IS_WINDOWS" != "1" ] && [ "$qt_detected" = "0" ] && [ "$framework_count" -gt 0 ]; then
   for fw in "${!framework_map[@]}"; do
     if [[ "$fw" == Qt* ]]; then
       qt_detected=1
@@ -1531,7 +1594,7 @@ if [ "$qt_detected" = "0" ] && [ "$framework_count" -gt 0 ]; then
   done
 fi
 # Also check for flat Qt libs (non-framework, e.g. Linux)
-if [ "$qt_detected" = "0" ] && [ -d "$out/lib" ]; then
+if [ "$IS_WINDOWS" != "1" ] && [ "$qt_detected" = "0" ] && [ -d "$out/lib" ]; then
   for f in "$out"/lib/libQt*.so* "$out"/lib/libQt*.dylib; do
     if [ -e "$f" ]; then
       qt_detected=1
@@ -1902,6 +1965,17 @@ if [ "$IS_WINDOWS" = "1" ]; then
   # bundle does not have.  Harmless at runtime (an absent import path is simply
   # empty) and invisible to Phase 6, whose converse check only fires when
   # bin/Qt6Quick.dll is present — which is precisely why it is worth not doing.
+  if [ "$qt_detected" = "1" ] && [ "$qt_is_host" != "1" ] && [ -z "$pe_app_dir" ]; then
+    # Unreachable as written -- on Windows qt_detected can now only be set by a
+    # hit in bin/, so bin/ exists. It is here because the guard below used to
+    # have no else: qt.conf was skipped in total silence and the build then died
+    # 800 lines later at "ERROR: bin/qt.conf is missing", blaming the consumer
+    # of the skip instead of the skip. Demonstrated reachable before the
+    # detection arms were interlocked.
+    echo "  ERROR: Qt was detected but this output has no bin/ to write qt.conf" >&2
+    echo "  into, so the Qt runtime contract cannot be satisfied here." >&2
+    exit 1
+  fi
   if [ "$qt_detected" = "1" ] && [ "$qt_is_host" != "1" ] && [ -d "$out/bin" ]; then
     echo "Phase 2f: Creating qt.conf..."
     {
@@ -2833,7 +2907,7 @@ if [ "$IS_WINDOWS" = "1" ]; then
     win_pe_files=$((win_pe_files + 1))
     fdir="$(dirname "$f")"
     pe_dir_index "$fdir"
-    pe_dir_index "$out/bin"
+    if [ -n "$pe_app_dir" ]; then pe_dir_index "$pe_app_dir"; fi
     f_arch="$(pe_arch_or_die "$f" "a PE in this bundle")"
     case " $win_archs " in *" $f_arch "*) ;; *) win_archs="$win_archs $f_arch" ;; esac
     while IFS= read -r imp; do
