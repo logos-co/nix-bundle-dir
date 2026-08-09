@@ -942,7 +942,7 @@ pe_sweep() {
             # two halves of the same decision reported the same situation
             # differently depending on which one hit it first.
             if [ -d "$app_dir/$beside_name" ]; then
-              echo "  ERROR: cannot mirror $beside_name into ${app_dir#$out/}: a" >&2
+              echo "  ERROR: cannot mirror $beside_name into ${app_dir#$out/}/: a" >&2
               echo "  DIRECTORY of that name is already there.  A directory cannot" >&2
               echo "  satisfy an import, and overwriting it is not something this" >&2
               echo "  script should guess at." >&2
@@ -955,6 +955,7 @@ pe_sweep() {
             }
             chmod u+w "$app_dir/$beside_name" 2>/dev/null || true
             unset 'pe_filetype_cache[$app_dir/$beside_name]'
+            unset 'pe_arch_cache[$app_dir/$beside_name]'
             # Post-condition, as the staging path below already has. This
             # branch used to copy and record with no check at all, so a failed
             # or truncated copy still marked the import satisfied. `pe_is_pe`
@@ -1012,7 +1013,7 @@ pe_sweep() {
         dest_name="$(basename "$src")"
         dest="$stage_dir/$dest_name"
         if [ -d "$dest" ]; then
-          echo "  ERROR: cannot stage $dest_name into ${stage_dir#$out/}: a" >&2
+          echo "  ERROR: cannot stage $dest_name into ${stage_dir#$out/}/: a" >&2
           echo "  DIRECTORY of that name is already there.  A directory cannot" >&2
           echo "  satisfy an import, and overwriting it is not something this" >&2
           echo "  script should guess at." >&2
@@ -1036,6 +1037,7 @@ pe_sweep() {
         # The path just changed on disk, so drop any classification cached for
         # it before asking what it now is.
         unset 'pe_filetype_cache[$dest]'
+        unset 'pe_arch_cache[$dest]'
         # `pe_is_pe` is part of the post-condition, not decoration: the whole
         # point of checking the provider was that a name is not a module, and a
         # copy that lands truncated or empty-but-nonzero is the same hole one
@@ -1485,17 +1487,36 @@ qt_is_host=0
 # bin/ rather than lib/.  Because the consumer of qt_detected has no `else`
 # arm, that miss used to skip the plugin scan, the QML scan AND qt.conf with no
 # message at all, producing a bundle that exits 0 and cannot start.
-if [ "$IS_WINDOWS" = "1" ] && [ -d "$out/bin" ]; then
-  for f in "$out"/bin/Qt6*.dll "$out"/bin/Qt5*.dll; do
-    if [ -e "$f" ]; then
+#
+# ...and the glob it was replaced with re-opened the same hole from the other
+# side.  `$out/bin/Qt6*.dll` cannot match on the module shape that this branch
+# added support for: a Logos module has no bin/, so the sweep stages Qt beside
+# the importer in lib/, and a bundle visibly containing lib/Qt6Core.dll printed
+# "no Qt libraries in this bundle" and exited 0 with the whole Windows Qt
+# contract in Phase 6 never evaluated.  Look wherever the sweep is allowed to
+# put things, which is anywhere in the tree, rather than at one directory.
+qt_module_shape=0
+if [ "$IS_WINDOWS" = "1" ]; then
+  pe_resolve_app_dir
+  qt_win_hit="$(find "$out" -type f \( -name 'Qt6*.dll' -o -name 'Qt5*.dll' \) -print -quit 2>/dev/null || true)"
+  if [ -n "$qt_win_hit" ]; then
+    qt_lib_name="$(basename "$qt_win_hit")"
+    if [ -n "$pe_app_dir" ]; then
       qt_detected=1
-      qt_lib_name="$(basename "$f")"
       if is_host_lib "$qt_lib_name"; then
         qt_is_host=1
       fi
-      break
+    else
+      # Qt IS here, and this output is a module rather than an application.
+      # Staging a plugin tree and writing qt.conf would be inventing an app
+      # layout for something that gets installed into someone else's tree —
+      # qt.conf, the platform plugin and the QML tree belong to the process
+      # that loads this module, not to the module.  So do not pretend to check
+      # a contract this output does not own; say so, loudly, instead of
+      # reporting "no Qt libraries in this bundle", which was false.
+      qt_module_shape=1
     fi
-  done
+  fi
 fi
 if [ "$qt_detected" = "0" ] && [ "$framework_count" -gt 0 ]; then
   for fw in "${!framework_map[@]}"; do
@@ -1759,7 +1780,16 @@ elif [ "$IS_WINDOWS" = "1" ]; then
   # Windows-only: on Unix the skip has never produced a broken bundle, and an
   # extra line there is a real (if small) change to a log this branch is
   # otherwise required to leave byte-identical.
-  echo "Phase 2b: Skipping Qt plugin/QML bundling (no Qt libraries in this bundle)"
+  if [ "$qt_module_shape" = "1" ]; then
+    echo "Phase 2b: Qt IS present in this bundle ($qt_lib_name), but the output" \
+         "has no application directory — it is a module, not an app."
+    echo "  qt.conf, the platform plugin and the QML tree belong to the process" \
+         "that loads this module, so they are NOT staged and NOT checked here."
+    echo "  If this output was meant to be an application, its bin/ is missing" \
+         "and the Qt runtime contract has gone unverified."
+  else
+    echo "Phase 2b: Skipping Qt plugin/QML bundling (no Qt libraries in this bundle)"
+  fi
 fi
 
 # ===========================================================================
@@ -1804,6 +1834,20 @@ if [ "$IS_WINDOWS" = "1" ]; then
     pe_sweep "pass $((2 + qml_restage_round)): + QML modules staged after the gate flipped"
   done
 
+  # The memo in pe_resolve_app_dir latches on first call, justified by "Phase 1
+  # has run by the time the first sweep does, so bin/ either exists or never
+  # will".  bundle.sh has exactly one `mkdir -p "$out/bin"`, in Phase 1, so that
+  # holds today — and nothing enforces it.  If a later phase ever creates bin/,
+  # staging silently keeps going beside importers while the log keeps saying
+  # there is no bin/: a silent success with no assertion behind it.  Assert it
+  # instead of trusting the comment.
+  if [ -z "$pe_app_dir" ] && [ -d "$out/bin" ]; then
+    echo "  ERROR: bin/ did not exist when the DLL sweep resolved the staging" >&2
+    echo "  destination, but it exists now, so everything was staged beside its" >&2
+    echo "  importer on the strength of a fact that stopped being true." >&2
+    echo "  Whatever phase created $out/bin has to run before Phase 2e." >&2
+    exit 1
+  fi
   pe_fail_on_unresolved
   # A statement, not an exit.  v1 exited here on the grounds that "a real Qt
   # bundle always needs at least one", which is true of a real Qt bundle and
@@ -1812,9 +1856,21 @@ if [ "$IS_WINDOWS" = "1" ]; then
   # makes this zero trustworthy — it proved the reader reads before any of this
   # ran — so a zero here is a fact about the bundle.
   if [ "$pe_staged_total" -eq 0 ]; then
-    echo "  DLL closure complete: nothing needed staging — every import was" \
-         "already satisfied from $pe_stage_label, from the importer's own" \
-         "directory, or by a Windows system DLL."
+    # Two arms, for the same reason the sweep-converged line above has two:
+    # this sentence enumerates DISTINCT places, and substituting
+    # $pe_stage_label into it collapses the first onto the second when there
+    # is no bin/ ("satisfied from each importer's own directory, from the
+    # importer's own directory, ..."), naming one place twice and silently
+    # dropping the fact that there is no application directory at all.
+    if [ -n "$pe_app_dir" ]; then
+      echo "  DLL closure complete: nothing needed staging — every import was" \
+           "already satisfied from bin/, from the importer's own directory, or" \
+           "by a Windows system DLL."
+    else
+      echo "  DLL closure complete: nothing needed staging — this output has no" \
+           "bin/, so every import was already satisfied from the importer's own" \
+           "directory or by a Windows system DLL."
+    fi
   else
     echo "  DLL closure complete: $pe_staged_total DLL(s) staged into $pe_stage_label"
   fi
@@ -2767,8 +2823,9 @@ if [ "$IS_WINDOWS" = "1" ]; then
   # Only mention bin/ in the unresolved-import error when there IS one; a
   # module-only output has none, and naming a directory that does not exist
   # sends the reader looking for a staging bug that is not there.
+  pe_resolve_app_dir
   app_present=""
-  [ -d "$out/bin" ] && app_present=1
+  [ -n "$pe_app_dir" ] && app_present=1
   # Same enumeration the sweep used — pe_files — so the fixer and the checker
   # cannot disagree about what a root is.  That asymmetry was a build failure
   # on valid input, twice.
@@ -2791,8 +2848,8 @@ if [ "$IS_WINDOWS" = "1" ]; then
       hit=""
       if [ -n "${pe_dir_have["$fdir|$key"]:-}" ]; then
         hit="$fdir/${pe_dir_have["$fdir|$key"]}"
-      elif [ -n "${pe_dir_have["$out/bin|$key"]:-}" ]; then
-        hit="$out/bin/${pe_dir_have["$out/bin|$key"]}"
+      elif [ -n "$pe_app_dir" ] && [ -n "${pe_dir_have["$pe_app_dir|$key"]:-}" ]; then
+        hit="$pe_app_dir/${pe_dir_have["$pe_app_dir|$key"]}"
       fi
       if [ -z "$hit" ]; then
         echo "  ERROR: ${f#"$out"/} imports $imp, which is in neither its own" \
