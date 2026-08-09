@@ -1147,6 +1147,27 @@ qt_candidate_matches_target() {
     # PE, which leaves find and sort writing into a closed pipe and printing
     # "write failed: Broken pipe" from inside the success path.
   done < <(find "$dir" \( -type f -o -type l \) 2>/dev/null | sort 2>/dev/null)
+  # KNOWN, UNFIXED, recorded rather than patched: the scan's exit STATUS is not
+  # checked either, and a failing scan leaves found_pe=0 AND found_foreign=0,
+  # which falls into the ACCEPT arm below -- accepting the NATIVE Linux qtbase
+  # plugin tree into a Windows bundle, the exact outcome this function exists to
+  # prevent.  Reachable only by injection (nix canonicalises store permissions).
+  #
+  # One SHAPE of guard is wrong, and it was written and reverted: checking the
+  # producer's status while keeping the pipeline.  The `break` above leaves find
+  # and sort writing into a closed pipe, so on the SUCCESS path the producer can
+  # die of SIGPIPE -- but only if it is still writing when the loop breaks.
+  # Measured on this builder's bash 5.3.9 with the exact
+  # `while read ... break ... done < <(find ... | sort ...); wait $!` shape: a
+  # 2-entry candidate tree gives `wait` rc 0, a 5000-entry one gives 141.  So it
+  # fires on LARGE candidate trees -- Qt's plugin tree among them -- not on
+  # every Qt bundle with a PE in it, as this comment previously claimed.
+  #
+  # The capture-then-here-string form used three times in this file has no pipe
+  # to break at all, and was built: it leaves the real Basecamp bundle green at
+  # the established NAR.  So a guard here is available, it just is not the one
+  # that was tried, and it is not worth attempting in the same change as five
+  # other fixes.
   if [ "$found_pe" = "1" ]; then
     return 0
   fi
@@ -1646,7 +1667,13 @@ elif [ "$IS_WINDOWS" = "1" ]; then
   # census (guarded by `[ -f ]`) does not.  The remaining asymmetry is in
   # DETECTION and is deliberately left alone: changing either arm's detection is
   # what produced four of the five regressions on this branch.
-  # Guarded like its two siblings.  The here-string form does NOT propagate the
+  # Guarded like its two siblings, and inert on real input for the same reason
+  # they are: a find failure is a traversal error independent of the `-type`
+  # predicate, so the sibling qt_win_hits scan at the top of this block fails
+  # first.  ("Twelve lines above" was wrong -- they are forty raw lines apart
+  # with zero intervening code lines.)  Reachable only by
+  # injecting a failure into this find alone, which is how it was demonstrated.
+  # The here-string form does NOT propagate the
   # substituted command's status under `set -e`, so a failing census scan simply
   # produced zero iterations and the build went green with the Note silently
   # gone -- demonstrated by injecting a failing find: rc 0, byte-identical NAR,
@@ -1701,8 +1728,13 @@ elif [ "$IS_WINDOWS" = "1" ]; then
   # tree.  qt.conf, the platform plugin and the QML tree belong to the process
   # that LOADS this module.  What was wrong before was the claim, not the skip.
 fi
-# A Windows bundle reaching either arm below means a Mach-O framework or an ELF
-# `libQt*.so*` in a PE tree: malformed input.  The takeover it used to cause was
+# A Windows bundle reaching either arm below means a Unix-format Qt library in a
+# PE tree: malformed input.  NOT a Mach-O FRAMEWORK, whatever this sentence used
+# to say -- macOS Qt is `Qt6Core.framework/Versions/A/Qt6Core`, with no lib
+# prefix and no extension, so the name-gated find below cannot see one and such
+# a bundle builds green.  That was the fifth comment on this branch caught
+# describing code that is not there; the blind spot is real and recorded rather
+# than papered over.  The takeover it used to cause was
 # real — on the module shape the flat arm set qt_detected=1, only qt_detected is
 # honoured downstream, so the module statement was dropped and the app-shaped Qt
 # path ran against a bundle with no bin/ to write qt.conf into.
