@@ -174,19 +174,83 @@ IS_WINDOWS="${IS_WINDOWS:-unknown}"
 # Whole-tree format census.  Only ever called on a path where the answer
 # changes what happens, because it is O(files) and the Unix path must not pay
 # for it: see the two call sites below.
+#
+# This is the only whole-tree format walk bundle.sh runs over `$out` itself.
+# (The other `*ELF*`/`*Mach-O*` tests are per-file dispatch inside trace_deps,
+# and a separate pair of walks inside the Phase 6 validator this script GENERATES,
+# which runs over its own `$test_dir`.  Neither is a second opinion about $out.)
+# There used to be one — a `find -name 'libQt*.so*' -o -name 'libQt*.dylib'` in
+# the Windows Qt refusal — and it was strictly weaker than this walk in three
+# measured ways.  Every false negative it produced was a build where THIS census
+# had already printed the right count one phase earlier and the bundle shipped
+# anyway, with the wrong-target ELF verifiably in the output tree.  The refusal
+# is now derived from these counters; see the call site in Phase 2b.
 tree_pe_count=0
 tree_unix_count=0
+tree_unix_qt=""
+
+# Is any COMPONENT of this path Qt-named?  Not the basename: macOS Qt is
+# `Qt6Core.framework/Versions/A/Qt6Core`, whose last component carries neither
+# the `lib` prefix nor an extension, so a basename test cannot see it — which
+# is exactly why the name-globbed find this replaces could not, and why
+# k2_modFrameworkQt built green at all five revisions of that block measured,
+# with the same output hash each time.  A DIRECTORY
+# component is equally load-bearing: `lib/vendor/libQt6Core.so.6/payload.bin`
+# is a wrong-target Qt payload whose own file name says nothing.
+#
+# Matched against the path with a leading `/` restored, so `*/libQt*` means
+# "some component STARTS with libQt" — the same anchoring `find -name 'libQt*'`
+# had, at every depth instead of only the last one.  No word splitting: an
+# IFS=/ loop would also glob, and a component containing `*` would then be
+# matched against the tree.
+qt_named_path() {
+  case "/${1#"$out"/}" in
+    */libQt*|*/Qt[0-9]*) return 0 ;;
+  esac
+  return 1
+}
+
 tree_census() {
   tree_pe_count=0
   tree_unix_count=0
-  local f ft
+  tree_unix_qt=""
+  local f ft files
+  # Captured and guarded, like its two siblings in the Windows Qt block (the
+  # three guarded capture scans in this file are exactly those).  The
+  # process-substituted form this replaces (`done < <(find ...)`) never checks
+  # the producer, so a failed walk read as "nothing of interest in this tree" —
+  # harmless at the Phase 1c call site, which then hard-errors on zero PEs, and
+  # a silent exit 0 at the second one, which is the whole defect being fixed.
+  files="$(find "$out" -type f)" || {
+    echo "  ERROR: could not walk $out to classify its contents; refusing to" >&2
+    echo "  answer any question about this bundle's formats on the strength of" >&2
+    echo "  a failed scan." >&2
+    exit 1
+  }
   while IFS= read -r f; do
-    ft="$(file -bL "$f" 2>/dev/null)" || continue
+    [ -n "$f" ] || continue
+    # `|| ft=""` rather than `|| continue`: a classifier that cannot answer is
+    # not the same fact as a file that is neither format, and collapsing the
+    # two is how the refusal downstream degraded to a silent exit 0 when `file`
+    # was unavailable — measured, by pointing that one call at a nonexistent
+    # command: rc 1 -> rc 0, no warning, ELF shipped.  `file` prints something
+    # for every regular file it can stat — "empty" for a zero-byte one — so an
+    # empty answer means the classifier itself is broken, and no verdict below
+    # this line would mean anything.
+    ft="$(file -bL "$f" 2>/dev/null)" || ft=""
     case "$ft" in
       *PE32*)         tree_pe_count=$((tree_pe_count + 1)) ;;
-      *Mach-O*|*ELF*) tree_unix_count=$((tree_unix_count + 1)) ;;
+      *Mach-O*|*ELF*) tree_unix_count=$((tree_unix_count + 1))
+                      if qt_named_path "$f"; then
+                        tree_unix_qt="${tree_unix_qt}${f#"$out"/}"$'\n'
+                      fi
+                      ;;
+      "")             echo "  ERROR: \`file\` could not describe ${f#"$out"/}." >&2
+                      echo "  Every format decision this bundler makes rests on that answer," >&2
+                      echo "  so there is nothing honest to report about this tree." >&2
+                      exit 1 ;;
     esac
-  done < <(find "$out" -type f 2>/dev/null)
+  done <<< "$files"
   return 0
 }
 
@@ -1728,68 +1792,83 @@ elif [ "$IS_WINDOWS" = "1" ]; then
   # tree.  qt.conf, the platform plugin and the QML tree belong to the process
   # that LOADS this module.  What was wrong before was the claim, not the skip.
 fi
-# A Windows bundle reaching either arm below means a Unix-format Qt library in a
-# PE tree: malformed input.  NOT a Mach-O FRAMEWORK, whatever this sentence used
-# to say -- macOS Qt is `Qt6Core.framework/Versions/A/Qt6Core`, with no lib
-# prefix and no extension, so the name-gated find below cannot see one and such
-# a bundle builds green.  That was the fifth comment on this branch caught
-# describing code that is not there; the blind spot is real and recorded rather
-# than papered over.  The takeover it used to cause was
-# real — on the module shape the flat arm set qt_detected=1, only qt_detected is
-# honoured downstream, so the module statement was dropped and the app-shaped Qt
-# path ran against a bundle with no bin/ to write qt.conf into.
+# A Windows bundle carrying a Qt library in ELF or Mach-O format is malformed
+# input: a PE process cannot load it, and its presence means something upstream
+# was built for the wrong target.  Say it, and stop.  Silence here was a real
+# regression once — an app-shaped Windows bundle holding lib/libQt6Core.so.6
+# went from a hard failure to "Skipping Qt plugin/QML bundling (no Qt libraries
+# in this bundle)" with Phase 6's whole Windows Qt contract unevaluated — and
+# trading a loud wrong answer for a quiet one is the trade this branch exists
+# to refuse.
 #
-# Gating them off Windows fixed that and bought a SILENT exit 0 in exchange: an
-# app-shaped Windows bundle holding lib/libQt6Core.so.6 went from a hard failure
-# to "Skipping Qt plugin/QML bundling (no Qt libraries in this bundle)" with
-# Phase 6's whole Windows Qt contract unevaluated.  Malformed either way — but
-# trading a loud wrong answer for a quiet one is the trade this branch exists to
-# refuse.  So: say it, and stop.
-# Over the WHOLE tree, like the module arm.  A depth-1 glob on $out/lib caught
-# lib/libQt6Core.so.6 and missed lib/vendor/libQt6Core.so.6 — the same silent
-# exit 0 this arm exists to refuse, one directory down.
+# Derived from the CENSUS, not from a second name glob.  What used to sit here
+# was `find -type f \( -name 'libQt*.so*' -o -name 'libQt*.dylib' \)` under an
+# `IS_WINDOWS=1 && qt_detected=0` gate — a strictly weaker re-derivation of a
+# question tree_census had already answered by content, on every Windows build,
+# a few phases earlier.  Its three blind spots were each built with a matched
+# control:
+#   * the `qt_detected = 0` gate exempted any APP bundle that contains real Qt,
+#     so a genuine wrong-target ELF Qt shipped beside it — D5_appQtElf and
+#     k5_appDetectedPlusElf both exited 0 with an x86-64 ELF still sitting at
+#     lib/vendor/libQt6Core.so.6 in the delivered tree;
+#   * a DIRECTORY named Qt6Core.dll in bin/ sets qt_detected through the app
+#     arm's `[ -e ]`, which suppressed the refusal with no Qt anywhere in the
+#     bundle (h2_dirSuppressElf rc 0, control h2c_ctlNoDir rc 1);
+#   * the name glob cannot see a macOS FRAMEWORK, which is where Mach-O Qt
+#     actually lives (k2_modFrameworkQt rc 0 at all five revisions of this
+#     block, each with the same output hash; control k2c rc 1).
+# and a fourth in its own error path: `case "$(file -bL "$f")"` discards the
+# status, so with `file` unavailable every entry fell through to the default
+# arm and the refusal became a silent exit 0.  Reproduced against the revision
+# this replaces by pointing that one call at a nonexistent command: D3_modElf
+# went rc 1 -> rc 0 and shipped its ELF, with no warning and with "Output
+# census: 1 PE file(s), 1 ELF/Mach-O file(s)" still printed above it.
+# tree_census now answers "I could not classify this" out loud instead of
+# folding it in with "not a Unix binary".
 #
-# The guard is `qt_detected` ONLY.  Adding `&& qt_module_shape = 0` was tried and
-# is a FALSE NEGATIVE: it disables this refusal exactly when a module carries a
-# real Windows Qt, which is the only case that will ever occur in production, so
-# a module could ship a Linux Qt6Core.so beside its Windows one and the bundler
-# would say nothing.  Built on both sides by two independent reviewers: deleting
-# the term restores rc 1 on a module carrying a genuine wrong-target ELF Qt,
-# while the case the term was added for -- a module with a real Windows Qt plus
-# an INERT text file named libQt6Core.so.6 -- stays green with a byte-identical
-# output.  The format test below already does that work; the extra term bought
-# only the blind spot.
+# What the census does NOT change is the one thing the old block got right: the
+# file has to BE an ELF or a Mach-O, never merely be named like one.  An
+# earlier revision keyed on the name and hard-failed a build over a 22-byte
+# TEXT file at lib/vendor/libQt6Core.so.6.  A name-shaped file that is neither
+# format is inert, and inert is not fatal — D4_modQtText stays green.
 #
-# The file has to BE an ELF or a Mach-O, not merely be named like one.
-# Keying on the name alone hard-failed a build over a 22-byte TEXT file at
-# lib/vendor/libQt6Core.so.6 — which is the "a name is not a module" defect this
-# same commit fixes on the app arm, reintroduced ten lines further down.  A
-# name-shaped file that is neither format is inert, and inert is not fatal.
-if [ "$IS_WINDOWS" = "1" ] && [ "$qt_detected" = "0" ]; then
-  # Captured, with the same guard its twin on the module arm carries.  The
-  # here-string form does NOT propagate the substituted command's status under
-  # `set -e`, so a failing scan yielded zero iterations and a silent exit 0 —
-  # the very outcome this arm exists to refuse, arriving through its own error
-  # path.  Same honest label as the twin: nix canonicalises store permissions,
-  # so nobody has made this find fail; it guards a future caller.
-  qt_win_unixnames="$(find "$out" -type f \( -name 'libQt*.so*' -o -name 'libQt*.dylib' \) | sort)" || {
-    echo "  ERROR: could not scan $out for ELF/Mach-O-named Qt libraries;" >&2
-    echo "  refusing to pass this bundle on the strength of a failed scan." >&2
-    exit 1
-  }
-  while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    case "$(file -bL "$f" 2>/dev/null)" in
-      *ELF*|*Mach-O*) ;;
-      *) continue ;;
-    esac
-    echo "  ERROR: this bundle targets Windows, but $(basename "$f") is a Qt" >&2
-    echo "  library built for ELF or Mach-O.  A PE process cannot load it, and" >&2
-    echo "  its presence means some input was built for the wrong target." >&2
+# The app arm's `[ -e ]` is deliberately NOT touched.  Changing either arm's
+# DETECTION is what produced four of the five regressions on this branch; what
+# was wrong was that a refusal consulted detection at all, and it no longer
+# does.  The directory still counts as Qt for detection, and the build still
+# fails downstream demanding a plugin tree — it just cannot buy silence here.
+#
+# Scope is Qt, NOT "any Unix binary in a Windows bundle", even though the
+# census counts those too and the wider number is right there.  The hazard this
+# exists for is specifically two Qt instances in one process; carrying a
+# foreign binary as DATA is an ordinary, valid thing for a bundle to do, which
+# is also why the mirror-image warning on the Unix arm was deleted (see the
+# wine-wrapper note at Phase 1c).  The subject set has controls that do exactly
+# that and must stay green — k4c_ctl ships an unrelated ELF in a
+# caller-declared extraDir — so widening this would fail real input for a
+# hazard it does not have.
+#
+# Runs AFTER the sweep rather than at the Phase 1c census, because Phase 2
+# stages files into the tree and a wrong-target Qt dragged in by the sweep has
+# to be caught as well.  The two calls genuinely see different trees: on the
+# real Basecamp Windows bundle Phase 1c counts 62 PEs and this one counts 75.
+if [ "$IS_WINDOWS" = "1" ]; then
+  tree_census
+  if [ -n "$tree_unix_qt" ]; then
+    echo "  ERROR: this bundle targets Windows, but it carries Qt libraries" >&2
+    echo "  built for ELF or Mach-O.  A PE process cannot load them, and their" >&2
+    echo "  presence means some input was built for the wrong target." >&2
     echo "  (A Windows Qt library is Qt6Core.dll — no lib prefix, .dll, in bin/.)" >&2
-    echo "      found at: ${f#"$out"/}" >&2
+    # ALL of them, not the first.  The block this replaces exited inside the
+    # loop, so which offender got named came down to sort order — the same
+    # defect the app arm's two-loop split exists to fix.  The walk has already
+    # found them all; there is no reason to report one.
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      echo "      found at: $f" >&2
+    done <<< "$tree_unix_qt"
     exit 1
-  done <<< "$qt_win_unixnames"
+  fi
 fi
 # The framework arm's Windows guard is DEFENSIVE, not a fix: framework_map is
 # populated only by trace_deps, which a Windows target never calls (the PE
