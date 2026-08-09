@@ -1552,9 +1552,11 @@ if [ "$IS_WINDOWS" = "1" ] && [ -n "$pe_app_dir" ]; then
   done
   for f in "$out"/bin/Qt6*.dll "$out"/bin/Qt5*.dll; do
     [ -e "$f" ] || continue
-    # `[ -e ]`, not `-f`: a DIRECTORY named like a Qt DLL keeps counting as
-    # "something claims to be Qt here", because that is what it did before and
-    # because it is not a thing to pass over quietly.
+    # `[ -e ]`, not `-f`: a DIRECTORY named like a Qt DLL keeps counting for
+    # DETECTION here, because that is what it did before and the build then
+    # fails downstream demanding a plugin tree.  Note the census loop above is
+    # `[ -f ]`-guarded and therefore does NOT list it -- correctly, because on
+    # this arm a directory is not ignored, it is counted.
     if [ -f "$f" ] && ! pe_is_pe "$f"; then
       continue
     fi
@@ -1634,17 +1636,33 @@ elif [ "$IS_WINDOWS" = "1" ]; then
   # first hit and across the pass boundary — a real lib/Qt6Core.dll beside a
   # text lib/Qt5Fake.dll reported nothing.
   #
-  # `-type d` as well, so the two arms agree about directories.  The app arm's
-  # `[ -e ]` deliberately counts a directory named like a Qt DLL; `find -type f`
-  # could not see one, so the identical input was treated differently depending
-  # only on which arm it landed in — the asymmetry this pair keeps being fixed
-  # for.  A directory cannot be a module, so it belongs in the census.
+  # `-type d` as well -- and the two arms still do NOT agree about directories.
+  # Saying they did was the fourth comment on this branch found describing code
+  # that is not there, so here is what is actually true: the app arm's `[ -e ]`
+  # COUNTS a directory named like a Qt DLL for detection (and the build then
+  # fails downstream demanding a plugin tree), while the module arm's
+  # `find -type f` cannot see one at all.  Each census reports what ITS OWN arm
+  # ignored, which is why the module census includes directories and the app
+  # census (guarded by `[ -f ]`) does not.  The remaining asymmetry is in
+  # DETECTION and is deliberately left alone: changing either arm's detection is
+  # what produced four of the five regressions on this branch.
+  # Guarded like its two siblings.  The here-string form does NOT propagate the
+  # substituted command's status under `set -e`, so a failing census scan simply
+  # produced zero iterations and the build went green with the Note silently
+  # gone -- demonstrated by injecting a failing find: rc 0, byte-identical NAR,
+  # no Note.  That is the silent-exit-0 shape this file documents as a defect
+  # sixty lines below, left in the one new scan the same commit added.
+  qt_win_census="$(find "$out" \( -type f -o -type d \) \( -name 'Qt6*.dll' -o -name 'Qt5*.dll' \) | sort)" || {
+    echo "  ERROR: could not scan $out for name-matching Qt entries; refusing to" >&2
+    echo "  report a census on the strength of a failed scan." >&2
+    exit 1
+  }
   qt_win_nonpe=""
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     pe_is_pe "$f" && continue
     qt_win_nonpe="${qt_win_nonpe:+$qt_win_nonpe }${f#"$out"/}"
-  done <<< "$(find "$out" \( -type f -o -type d \) \( -name 'Qt6*.dll' -o -name 'Qt5*.dll' \) | sort)"
+  done <<< "$qt_win_census"
   for qt_pass in 'Qt6' 'Qt5'; do
     if [ "$qt_module_shape" = "1" ]; then break; fi
     while IFS= read -r f; do
@@ -1676,7 +1694,7 @@ elif [ "$IS_WINDOWS" = "1" ]; then
   # "1 of 3 name-matching file(s) rejected as not-a-PE".  Identical input,
   # opposite treatment, decided only by which arm it landed in.
   if [ -n "$qt_win_nonpe" ]; then
-    echo "  Note: ignored name-matching non-PE file(s): $qt_win_nonpe"
+    echo "  Note: ignored name-matching entries that are not PEs: $qt_win_nonpe"
   fi
   # Deliberately NOT qt_detected: staging a plugin tree and writing qt.conf
   # would invent an app layout for something installed into someone else's
@@ -1699,19 +1717,23 @@ fi
 # lib/libQt6Core.so.6 and missed lib/vendor/libQt6Core.so.6 — the same silent
 # exit 0 this arm exists to refuse, one directory down.
 #
-# `qt_module_shape` is in the guard, not just `qt_detected`.  The module arm
-# deliberately never sets qt_detected, so keying only on that made this refusal
-# UNCONDITIONAL on the module shape: a module bundle holding a real Windows
-# Qt6Core.dll AND an inert lib/vendor/libQt6Core.so.6 went from rc 0 to rc 1,
-# while the same two files in an app-shaped bundle stayed green.  The question
-# this arm asks is "was any Windows Qt found", and both variables answer it.
+# The guard is `qt_detected` ONLY.  Adding `&& qt_module_shape = 0` was tried and
+# is a FALSE NEGATIVE: it disables this refusal exactly when a module carries a
+# real Windows Qt, which is the only case that will ever occur in production, so
+# a module could ship a Linux Qt6Core.so beside its Windows one and the bundler
+# would say nothing.  Built on both sides by two independent reviewers: deleting
+# the term restores rc 1 on a module carrying a genuine wrong-target ELF Qt,
+# while the case the term was added for -- a module with a real Windows Qt plus
+# an INERT text file named libQt6Core.so.6 -- stays green with a byte-identical
+# output.  The format test below already does that work; the extra term bought
+# only the blind spot.
 #
-# And the file has to BE an ELF or a Mach-O, not merely be named like one.
+# The file has to BE an ELF or a Mach-O, not merely be named like one.
 # Keying on the name alone hard-failed a build over a 22-byte TEXT file at
 # lib/vendor/libQt6Core.so.6 — which is the "a name is not a module" defect this
 # same commit fixes on the app arm, reintroduced ten lines further down.  A
 # name-shaped file that is neither format is inert, and inert is not fatal.
-if [ "$IS_WINDOWS" = "1" ] && [ "$qt_detected" = "0" ] && [ "$qt_module_shape" = "0" ]; then
+if [ "$IS_WINDOWS" = "1" ] && [ "$qt_detected" = "0" ]; then
   # Captured, with the same guard its twin on the module arm carries.  The
   # here-string form does NOT propagate the substituted command's status under
   # `set -e`, so a failing scan yielded zero iterations and a silent exit 0 —
