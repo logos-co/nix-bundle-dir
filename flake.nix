@@ -19,6 +19,29 @@
         mkBundle = import ./mkBundle.nix { inherit pkgs; };
       });
 
+      # `nix flake check` builds this; so does tests/smoke.sh, which is what
+      # CI runs. See tests/extra-dirs.nix for why the extraDirs contract cannot
+      # be expressed through smoke.sh's `nix bundle --bundler . nixpkgs#hello`
+      # calls at all.
+      checks = forAllSystems ({ pkgs, ... }: {
+        extra-dirs-nested =
+          (import ./tests/extra-dirs.nix {
+            inherit pkgs;
+            mkBundle = import ./mkBundle.nix { inherit pkgs; };
+          }).nested;
+      });
+
+      # A subject that MUST fail to build. Kept out of `checks` on purpose:
+      # `nix flake check` would build it and call the repo broken. smoke.sh
+      # builds it expecting the failure, and asserts what the failure says.
+      tests = forAllSystems ({ pkgs, ... }: {
+        extra-dirs-dirty =
+          (import ./tests/extra-dirs.nix {
+            inherit pkgs;
+            mkBundle = import ./mkBundle.nix { inherit pkgs; };
+          }).dirty;
+      });
+
       bundlers = forAllSystems ({ pkgs, ... }:
         let
           mkBundle = import ./mkBundle.nix { inherit pkgs; };
