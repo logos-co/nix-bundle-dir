@@ -34,11 +34,13 @@
 #
 #   * a pattern the CALLER wrote deletes. `hostLibs = [ "Qt*" ]` on a Qt plugin
 #     package removes that package's own Qt6*.dll, and that is the contract;
-#   * a pattern a BUNDLER injects on the caller's behalf never reaches the PE
-#     path at all — see `bundlers.<sys>.qtPlugin` in flake.nix, which appends
-#     `Qt*` only on a non-Windows target;
-#   * `extraDirs` is never touched. Those directories are named by the caller,
-#     one by one, as "carry this";
+#   * no bundler in THIS repo injects a pattern that reaches the PE path — see
+#     `bundlers.<sys>.qtPlugin` in flake.nix, which appends `Qt*` only on a
+#     non-Windows target.  That is not a census of every caller: nix-bundle-lgx
+#     injects its own list and is kept off this path by routing, not by rule;
+#   * nothing is REMOVED from `extraDirs` -- those directories are named by the
+#     caller, one by one, as "carry this".  One-directional: the sweep may still
+#     STAGE a dependency into one when the importer lives there;
 #   * and what does go is checked (`hostBundle`) or listed by name in the log
 #     as UNVERIFIED, so an over-broad list is loud rather than silent.
 #
@@ -118,9 +120,12 @@
 # PATH, or as the current directory).
 #
 # Not consulted on ELF/Mach-O, and refused there rather than silently dropped —
-# see the `throwIf` below. Those paths are unchanged by this argument, down to
-# the byte, and extending the check to them is a separate change with its own
-# evidence.
+# see the `throwIf` below.  Measured rather than asserted: across the
+# non-Windows subject set this branch is A/B'd on, every output tree and every
+# build log is byte-identical to origin/main, with a null-change control used to
+# attribute log noise.  That is evidence over those subjects, not a proof over
+# all inputs.  Extending the check to ELF/Mach-O is a separate change with its
+# own evidence.
 , hostBundle ? null
 , extraDirs ? []
 , extraClosurePaths ? []

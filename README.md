@@ -96,11 +96,16 @@ declared what*:
 - **A pattern you write deletes.** `hostLibs = [ "Qt*" ]` on a Qt plugin package
   removes that package's own `Qt6*.dll` too. That is the contract, not an
   accident — and `hostBundle` is how you make it checkable.
-- **A pattern the bundler injects does not.** `bundlers.<sys>.qtPlugin` appends
-  `Qt*` for you; it appends it only on non-Windows targets, where `hostLibs`
-  cannot delete anything.
-- **`extraDirs` is never touched.** Those directories are named by you, one by
-  one, as "carry this"; a name glob does not overrule that.
+- **No bundler in this repo injects one that does.** `bundlers.<sys>.qtPlugin`
+  appends `Qt*` for you, and only on non-Windows targets, where `hostLibs`
+  cannot delete anything. That is a statement about this repo's bundlers, not
+  about every caller: `nix-bundle-lgx` injects a list of its own and is kept off
+  this path by routing rather than by rule.
+- **Nothing is removed from `extraDirs`.** Those directories are named by you,
+  one by one, as "carry this"; a name glob does not overrule that. Note the
+  guarantee is one-directional: the sweep may still STAGE a dependency into a
+  declared directory when the importer lives there, which is what makes such a
+  bundle loadable.
 - **A strip that would empty the bundle fails the build.**
 
 Do not read anything into the shape of the patterns. Cross-platform spellings

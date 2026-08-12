@@ -1048,9 +1048,11 @@ pe_is_host_lib() {
 # claim is still LISTED, once, at the end of Phase 6 — an unverified strip is
 # visible in the log rather than implicit.
 #
-# PE path only.  The Unix arms of `is_host_lib` are untouched by this whole
-# block, so a non-Windows bundle's output tree and log stay byte-identical to
-# what they were before hostBundle existed.
+# PE path only: the Unix arms of `is_host_lib` are untouched by this block.
+# What that has been shown to mean, over the non-Windows subject set this branch
+# is A/B'd on: every output tree and build log byte-identical to origin/main,
+# with a null-change control attributing the log noise.  Evidence over those
+# subjects, not a proof over all inputs.
 declare -A pe_host_have      # lowercased base name -> path, host application dir
 declare -A pe_host_tree      # lowercased base name -> path, anywhere in the host
 declare -A pe_host_claims    # name this build trusted the host for -> why
@@ -1280,17 +1282,24 @@ pe_in_extra_dir() {
 # "do not add".  The rule is about who DECLARED the pattern and what the caller
 # asked to carry — it infers nothing about a file from how it got here:
 #
-#   1. Only a CALLER's pattern may delete.  A pattern a bundler injects on the
-#      caller's behalf never reaches this function: `bundlers.<sys>.qtPlugin`
+#   1. Only a CALLER's pattern may delete.  Of the bundlers in THIS repo, none
+#      injects a pattern that reaches this function: `bundlers.<sys>.qtPlugin`
 #      appends `Qt*` to hostLibs itself, which is meaningful only on Unix (where
 #      hostLibs filters what gets ADDED), and flake.nix now appends it only on a
-#      non-Windows target.  Measured on the real Windows Qt bundle while that
+#      non-Windows target.  That is a fact about this repo's four bundlers, not
+#      a census of every caller: nix-bundle-lgx injects a twelve-entry hostLibs
+#      list of its own, which cannot reach here today only because it routes
+#      Windows through mkWindowsPayload instead of this bundler.  Whoever
+#      changes that has to re-read this rule.  Measured on the real Windows Qt bundle while that
 #      injection still reached here: 816 PEs in, 796 out, exit 0 — the bundler
 #      deleting the very plugins it was asked to package, silently, because the
 #      PE match folds case and `Qt*` reads as `qt*` against `qtquick2plugin.dll`.
-#   2. `extraDirs` is never touched.  Those directories are named by the caller,
-#      one by one, as "carry this"; their contents are the caller's, whatever a
-#      hostLibs glob makes of the file names.  Measured before this exception: a
+#   2. Nothing is REMOVED from `extraDirs`.  Those directories are named by the
+#      caller, one by one, as "carry this"; their contents are the caller's,
+#      whatever a hostLibs glob makes of the file names.  One-directional on
+#      purpose: the sweep may still STAGE a dependency INTO a declared
+#      directory when the importer lives there, which is what makes such a
+#      bundle loadable.  Measured before this exception: a
 #      module with `extraDirs = [ "share/assets" ]` holding a DLL shipped
 #      `share/assets/` EMPTY, rc=0.
 #
@@ -2937,10 +2946,12 @@ if [ "$IS_WINDOWS" = "1" ]; then
     # assertion: `qt_detected=1` is written at exactly three places in this file
     # (grep it), two of which are inside `[ "$IS_WINDOWS" != "1" ]` blocks and
     # cannot run on this arm, and the third is inside the `[ -d "$out/bin" ]`
-    # branch of Qt detection.  Nothing in this script creates bin/ (the sweep
-    # documents at length why `mkdir -p "$out/bin"` would be wrong), so
-    # pe_resolve_app_dir cannot answer "no bin/" for a build that took that
-    # branch.  The proof is only as good as those three sites: add a fourth and
+    # branch of Qt detection.  The only `mkdir -p "$out/bin"` in this file is
+    # Phase 1's, and it is guarded on `[ -d "$DRV_PATH/bin" ]` — the script
+    # mirrors the source's bin/ and never INVENTS one (the sweep documents at
+    # length why inventing one would be wrong).  So `$out/bin` exists exactly
+    # when the source had it, pe_resolve_app_dir runs after Phase 1, and it
+    # cannot answer "no bin/" for a build that took that branch.  The proof is only as good as those three sites: add a fourth and
     # this arm becomes live again, which is the reason it is kept.
     #
     # It is here because the guard below used to have no else: qt.conf was

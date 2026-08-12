@@ -22,9 +22,11 @@
 #
 #   * a pattern the CALLER wrote deletes — including one that matches the
 #     package's own build products;
-#   * a pattern a BUNDLER injects never reaches the PE path (flake.nix's
-#     `qtPlugin` appends `Qt*` only on a non-Windows target);
-#   * a directory named in `extraDirs` is never touched.
+#   * no bundler in THIS repo injects a pattern that reaches the PE path
+#     (flake.nix's `qtPlugin` appends `Qt*` only on a non-Windows target); that
+#     is a fact about this repo's bundlers, not about every caller;
+#   * nothing is REMOVED from a directory named in `extraDirs` -- the sweep may
+#     still stage a dependency into one.
 #
 # The fixtures below therefore no longer distinguish LINKED from COPIED DLLs as
 # a matter of policy — `moduleLinked` and `moduleCopied` are stripped alike, and
@@ -219,11 +221,14 @@ let
   };
 
   # SHAPE 1g: a bin/ holding a DIRECTORY named like a Qt DLL. Contrived-looking
-  # and not invented: it is the one shape that still reaches the
+  # and not invented: it is A shape that reaches the
   # `pe_is_host_lib "$qt_lib_name"` arm in Qt detection, because the strip walks
   # `-type f` and cannot remove a directory while the detection loop's `[ -e ]`
-  # counts one. bundle.sh has carried three different wrong claims about that
-  # arm's reachability; this is what makes the current one checkable.
+  # counts one. bundle.sh has carried FOUR different wrong claims about that
+  # arm's reachability -- and the fourth was this sentence, which said "the one
+  # shape that still reaches" while a fixture asserting checkability is exactly
+  # the wrong place to make an exhaustiveness claim. This subject makes ONE
+  # route checkable. It is not a census.
   qtDirModule = mingw.stdenv.mkDerivation {
     name = "hostlibs-qt-dir-module";
     dontUnpack = true;
@@ -562,8 +567,10 @@ in
   # The app shape. Windows resolves a host-provided DLL through the LOADING
   # PROCESS's own directory; when the bundle has an executable of its own that
   # directory is the bundle's bin/, where the stripped DLLs no longer are.
-  # Measured: such a bundle dies 0xC0000135 before main() with no output, and
-  # runs only with the host's bin/ on PATH. It used to build green here.
+  # Measured on winvm: such a bundle dies 0xC0000135 before main() with no
+  # output, and runs with the host's bin/ on PATH -- or as the current
+  # directory, since the EXE search order includes CWD. It used to build green
+  # here.
   appShapeRefused = bundleOf {
     drv = appLinked; name = "hostlibs-fail-app";
     hostLibs = hostDlls; hostBundle = hostGood;
