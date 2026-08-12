@@ -19,14 +19,25 @@
 #
 #   hostLibs = [ "libQt*" "libcrypto.so*" "libssl.so*" "libz.so*" ... ];
 #
-# The spellings do not transfer and are not meant to: `libz*` never matches
-# `zlib1.dll`, `libcrypto*` never matches `libcrypto-3-x64.dll`. A list written
-# for the wrong platform therefore strips LESS than intended rather than more,
-# which on Windows is inert (a duplicate of a DLL the host has already loaded
-# is never consulted) where the opposite is fatal. bundle.sh says so in the log
-# when a declared list matches nothing at all. See the long note above
-# `pe_is_host_lib` in bundle.sh for why the LIST is shared and only the MATCH
-# is platform-specific.
+# The spellings do not transfer and are not meant to. A previous version of
+# this comment went further and claimed a list written for the wrong platform
+# can only strip LESS than intended — "`libcrypto*` never matches
+# `libcrypto-3-x64.dll`" — which is simply false: it matches. Some Unix
+# spellings do under-match (`libz*` cannot match `zlib1.dll`), but nothing in
+# this design may rest on that.
+#
+# What keeps a wrong list from being destructive is not the shape of the glob:
+#
+#   * on the PE path the strip may only remove a file that came along WITH the
+#     package — one the bundler staged, or one win-dll-link.sh linked in from
+#     another store path — and never a file the derivation's own build
+#     produced (the payload rule; see `pe_strip_host_libs` in bundle.sh);
+#   * `hostBundle` below turns every remaining claim into a checked fact;
+#   * and bundle.sh says so in the log when a declared list matches nothing at
+#     all, which is what a wrong-namespace list looks like.
+#
+# See the long note above `pe_is_host_lib` in bundle.sh for why the LIST is
+# shared and only the MATCH is platform-specific.
 , hostLibs ? []
 # The host's own assembled bundle, used to CHECK `hostLibs` rather than take it
 # on trust. PE path only.
@@ -45,9 +56,14 @@
 # host can be a repo it has no other reason to depend on, and making this
 # mandatory would put the strip out of reach of the packages that need it most.
 #
-# Not consulted on ELF/Mach-O: those paths are unchanged by this argument, down
-# to the byte, and extending the check to them is a separate change with its
-# own evidence.
+# Passing it with an EMPTY hostLibs is refused by bundle.sh rather than
+# ignored: there is no claim for it to check, so it could only report success
+# about nothing.
+#
+# Not consulted on ELF/Mach-O, and refused there rather than silently dropped —
+# see the `throwIf` below. Those paths are unchanged by this argument, down to
+# the byte, and extending the check to them is a separate change with its own
+# evidence.
 , hostBundle ? null
 , extraDirs ? []
 , extraClosurePaths ? []
@@ -231,9 +247,32 @@ let
   ];
 
   allSystemLibs = (if useDefaultSystemLibs then defaultSystemLibs else []) ++ systemLibs;
+
+  # `hostBundle` is a PE-path argument. Where Nix already KNOWS the target is
+  # not Windows, refuse at evaluation time rather than accept the argument and
+  # consult it nowhere: an argument that is silently ignored is the defect
+  # shape this file spends its length refusing, and this one was ignored on
+  # every non-PE bundle and on every PE bundle with an empty hostLibs.
+  #
+  # `isWindowsStr == "0"` only — not `!= "1"`. On "unknown" Nix has no answer
+  # to give and bundle.sh resolves the target in Phase 1c; that case is refused
+  # there, after the resolution, which is the only place it can be judged.
+  checkHostBundle = out:
+    pkgs.lib.throwIf (hostBundle != null && isWindowsStr == "0") ''
+      mkBundle: hostBundle was given for ${name}, whose target Nix reports as
+      non-Windows (drv.stdenv.hostPlatform.isWindows = false).
+
+      hostBundle checks hostLibs claims against the directory the WINDOWS
+      loader searches for the host process. There is no such directory on ELF
+      or Mach-O, so nothing would consult it and the argument would be a
+      declaration with no effect.
+
+      Drop hostBundle for this target, or pass windowsTarget = true if this
+      really is a Windows tree whose derivation carries no stdenv to read.
+    '' out;
 in
 
-pkgs.stdenv.mkDerivation {
+checkHostBundle (pkgs.stdenv.mkDerivation {
   pname = "${name}-bundle";
   version = drv.version or "0";
 
@@ -297,4 +336,4 @@ pkgs.stdenv.mkDerivation {
   '';
 
   installPhase = "true";
-}
+})

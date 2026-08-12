@@ -142,6 +142,94 @@ for dir in "${extra_dirs[@]+"${extra_dirs[@]}"}"; do
   fi
 done
 
+# ---------------------------------------------------------------------------
+# Phase 1d — which files here did the DERIVATION ITSELF produce?
+# ---------------------------------------------------------------------------
+# The census that separates this package's PAYLOAD from the dependencies that
+# merely travelled with it, and it has to be taken HERE — the last moment when
+# `$out` holds Phase 1's copy of `$DRV_PATH` and nothing else.  Everything the
+# bundler adds after this point (the PE sweep's closure copies, Phase 2b's Qt
+# plugin and QML trees, the mirror into bin/) is by construction not payload,
+# which is why the answer is "was it in the census" and not a second walk.
+#
+# WHY the distinction exists at all: `hostLibs` on the Unix path only ever
+# FILTERS WHAT GETS ADDED — `is_host_lib` is consulted inside `trace_deps`,
+# which copies dependencies in, and nothing on that path ever deletes something
+# Phase 1 wrote.  The PE path needs to DELETE, because on Windows the
+# dependency closure has already been staged into the derivation's own output
+# before the bundler ever sees it: nixpkgs' win-dll-link.sh runs in fixup and
+# links every DLL an import table names into `$out/bin` (and, where a package
+# calls `linkDLLsInfolder` itself, `$out/lib`).  Deleting and filtering are not
+# the same operation, and treating them as one is how a pattern that is inert
+# on Unix becomes destructive on Windows.
+#
+# So the rule the strip enforces is: it may remove a DEPENDENCY that came along
+# with this package, never a file the package's own build produced.  The signal
+# is exact and needs no heuristics, because win-dll-link.sh stages by
+# `ln -sr` — a SYMLINK into another store path — while a derivation's own build
+# products are real files in its own output.  Phase 1 copies with `cp -aL`, so
+# by the time a file is in `$out` both look alike; asking `$DRV_PATH` before
+# that distinction is lost is the whole point of taking the census here.
+#
+# Honest limit: a derivation whose output is entirely symlinks into OTHER store
+# paths (`symlinkJoin`, and buildEnv-shaped outputs generally) has, by this
+# reading, no payload of its own.  That is literally true — it produced no file
+# — and the consequence is that `hostLibs` governs its whole tree, exactly as
+# it did before this census existed.  The floor in `pe_strip_host_libs` is what
+# stands under that case.
+declare -A pe_payload        # absolute path in $out -> 1, the drv's own output
+pe_payload_own=0             # files the derivation produced
+pe_payload_linked=0          # files it only linked in from another store path
+pe_payload_censused=""
+
+pe_payload_census() {
+  [ -n "$pe_payload_censused" ] && return 0
+  pe_payload_censused=1
+  local drv_real f rel src src_real files
+  # Canonicalised on both sides: `$DRV_PATH` may itself be reached through a
+  # symlink, and a prefix test between a canonical path and a non-canonical one
+  # answers "not payload" for the derivation's entire output.
+  drv_real="$(readlink -f "$DRV_PATH")" || {
+    echo "  ERROR: could not canonicalise DRV_PATH ($DRV_PATH); refusing to" >&2
+    echo "  classify anything as this derivation's own output on a failed read." >&2
+    exit 1
+  }
+  files="$(find "$out" -type f)" || {
+    echo "  ERROR: could not walk $out to take the payload census; refusing to" >&2
+    echo "  decide what may be stripped on the strength of a failed scan." >&2
+    exit 1
+  }
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    rel="${f#"$out"/}"
+    src="$DRV_PATH/$rel"
+    # No counterpart in the derivation at all: not something Phase 1 copied, so
+    # not payload.  Nothing produces this today (Phase 1 is the only writer so
+    # far) and it is handled rather than assumed.
+    [ -e "$src" ] || continue
+    src_real="$(readlink -f "$src")" || continue
+    case "$src_real" in
+      "$drv_real"|"$drv_real"/*)
+        pe_payload["$f"]=1
+        pe_payload_own=$((pe_payload_own + 1))
+        ;;
+      *)
+        pe_payload_linked=$((pe_payload_linked + 1))
+        ;;
+    esac
+  done <<< "$files"
+  return 0
+}
+
+# Taken unconditionally except where Nix has already said the target is Unix,
+# so that stdout on the ELF/Mach-O path is byte-for-byte what it was: this
+# function prints nothing, and the summary line is emitted by the PE section
+# that consults it.  "unknown" still takes the census, because Phase 1c may yet
+# resolve it to Windows.
+if [ "${IS_WINDOWS:-unknown}" != "0" ]; then
+  pe_payload_census
+fi
+
 # ===========================================================================
 # Phase 1c — What TARGET is this bundle for?
 # ===========================================================================
@@ -286,6 +374,28 @@ elif [ "$IS_WINDOWS" = "1" ]; then
     exit 1
   fi
   echo "  Output census: $tree_pe_count PE file(s), $tree_unix_count ELF/Mach-O file(s)"
+  # The Phase 1d census, reported where it can be read against the one above.
+  # `$pe_payload_linked` is the interesting number: those are the files
+  # win-dll-link.sh linked into the derivation's output from somewhere else,
+  # i.e. exactly the set `hostLibs` is allowed to remove from.
+  echo "  Payload census: $pe_payload_own file(s) this derivation produced," \
+       "$pe_payload_linked linked in from other store paths"
+fi
+
+# `hostBundle` is a PE-path argument, and a bundle that was handed one on a
+# non-PE target must say so rather than accept it and quietly do nothing.
+# mkBundle.nix refuses this at EVALUATION time whenever Nix already knows the
+# target is Unix; this arm covers the one case it cannot see — a derivation
+# with no stdenv to read, defaulted to Unix a few lines above.
+if [ "$IS_WINDOWS" != "1" ] && [ -n "${HOST_BUNDLE:-}" ]; then
+  echo "  ERROR: hostBundle was given, but this bundle's target is not Windows." >&2
+  echo "      hostBundle = $HOST_BUNDLE" >&2
+  echo "  hostBundle checks hostLibs claims against the directory the Windows" >&2
+  echo "  loader searches; there is no such directory on ELF or Mach-O, so" >&2
+  echo "  nothing here would consult it.  Drop the argument, or pass" >&2
+  echo "  windowsTarget = true if this really is a Windows tree with no stdenv" >&2
+  echo "  to read it off." >&2
+  exit 1
 fi
 # NOTE there is deliberately no `else` arm for the Unix target.
 #
@@ -898,17 +1008,25 @@ pe_dir_index() {
 #     knows which spelling it needs.  A second argument only adds a way to fill
 #     in the one that is not consulted, and an argument that is silently
 #     ignored is the exact defect shape this file spends its length refusing.
-#   * The two spellings do not collide in the dangerous direction.  Unix globs
-#     under-match on Windows rather than over-matching: `libz*` never matches
-#     `zlib1.dll`, `libcrypto*` never matches `libcrypto-3-x64.dll`,
-#     `libstdc++.so*` never matches `libstdc++-6.dll`.  Under-stripping ships a
-#     duplicate of a DLL the host already has, and Windows binds an import to a
-#     module already loaded under that base name BEFORE searching any
-#     directory, so the duplicate is inert.  Over-stripping is fatal and
-#     silent.  The accident therefore falls on the safe side.
-#   * And it is not silent either: `hostBundle` below turns every name this
-#     path drops into a CHECKED claim, so a list that strips the wrong thing
-#     fails the build instead of failing at LoadLibrary.
+#   * A list written for the wrong platform is CAUGHT rather than tolerated.
+#     `hostBundle` below turns every name this path drops into a claim checked
+#     against the host's own tree, so a list that strips the wrong thing fails
+#     the build instead of failing at LoadLibrary; and with no hostBundle the
+#     claims are printed, by name, marked UNVERIFIED.
+#
+# An earlier revision of this comment argued the case differently and was
+# WRONG, so the wrong argument is recorded rather than quietly deleted: it
+# claimed Unix spellings can only under-match on Windows — "`libcrypto*` never
+# matches `libcrypto-3-x64.dll`" — and concluded the accident always falls on
+# the safe side.  It matches.  `case libcrypto-3-x64.dll in libcrypto*` is
+# true, and so is `qt*` against `qtquick2plugin.dll`.  Some Unix spellings do
+# under-match (`libz*` really cannot match `zlib1.dll`, and `libstdc++.so*`
+# really cannot match `libstdc++-6.dll`), but "some do" is not "none can", and
+# nothing about this design may rest on the stronger claim.  What actually
+# keeps an over-broad pattern from being fatal is the payload rule in
+# `pe_strip_host_libs` — a pattern can only ever remove a dependency that came
+# along with the package, never something the package's own build produced —
+# plus `hostBundle`, plus the floor.  Not the shape of the glob.
 #
 # What is PE-specific is the MATCH, not the list.  `is_host_lib` (Unix) is
 # case-sensitive and stays byte-for-byte what it was.  PE import tables spell
@@ -964,9 +1082,11 @@ declare -A pe_host_have      # lowercased base name -> path, host application di
 declare -A pe_host_tree      # lowercased base name -> path, anywhere in the host
 declare -A pe_host_claims    # name this build trusted the host for -> why
 declare -A pe_host_import_logged
+declare -A pe_stripped       # absolute path this build REMOVED as host-provided
 pe_host_indexed=""
 pe_host_app_dir=""
 pe_host_dropped_total=0
+pe_host_payload_total=0   # matched hostLibs, kept because the drv produced it
 
 pe_host_index() {
   [ -n "$pe_host_indexed" ] && return 0
@@ -1052,7 +1172,7 @@ pe_assert_host_provides() {
   exit 1
 }
 
-# Remove from the staged tree every PE the host already provides.
+# Remove from the staged tree every DEPENDENCY the host already provides.
 #
 # This is the half that shrinks the package.  Skipping a host-provided name
 # during the sweep stops the bundler PULLING one in; it does nothing about the
@@ -1061,6 +1181,34 @@ pe_assert_host_provides() {
 # derivation's own lib/, so a Logos module arrives here carrying ~36 MB of Qt,
 # OpenSSL and C++ runtime (Qt6Core.dll alone is 15 MB) that the host ships.
 #
+# THE PAYLOAD RULE, which is what keeps "delete" from being a different and
+# more dangerous operation than the Unix path's "do not add":
+#
+#   this may only remove a file that came along WITH the package — one the
+#   bundler staged, or one win-dll-link.sh linked into the derivation's output
+#   from another store path — and never a file the derivation's own build
+#   produced.
+#
+# `pe_payload` (Phase 1d) is that set, taken before anything else wrote to
+# `$out`.  Two measured defects close on this one rule and neither closes on a
+# rule about pattern syntax:
+#
+#   * `bundlers.<sys>.qtPlugin` appends `Qt*` to hostLibs itself — a list the
+#     BUNDLER writes, not the caller — and the PE match folds case on both
+#     sides, so `Qt*` is `qt*` and matches `qtquick2plugin.dll`,
+#     `qtquickcontrols2plugin.dll`, `qtqmlmodelsplugin.dll`.  Those files ARE
+#     the plugin bundle's payload.  Measured on the real Windows Qt bundle
+#     before this rule: 816 PEs in, 796 out, exit 0 — the bundler deleting the
+#     thing it was asked to package, silently.
+#   * `extraDirs` names directories the caller explicitly asked to carry, and
+#     the strip walked `find "$out"` with no exception for them.  Measured: a
+#     module with `extraDirs = [ "share/assets" ]` holding a DLL shipped
+#     `share/assets/` empty, rc=0.  Not fixed by exempting extraDirs wholesale
+#     either — the sweep legitimately stages a dependency INTO an extraDir when
+#     the importer lives there (see the note above the Qt census), and those
+#     are still the host's to provide.  Provenance separates the two; a path
+#     prefix cannot.
+#
 # Called at the top of every sweep rather than once, because Phase 2b stages
 # whole Qt plugin and QML trees between sweeps and those trees are copied
 # wholesale — a host-provided DLL sitting inside one would otherwise survive
@@ -1068,8 +1216,26 @@ pe_assert_host_provides() {
 # level, which is two answers to one question.
 pe_strip_host_libs() {
   local label="$1"
-  local f b files removed=0 kept=0 examined=0
+  local f b files removed=0 kept=0 examined=0 payload_kept=0
   if [ -z "${host_patterns[*]+x}" ]; then
+    # hostBundle is validated even here, and BEFORE the "nothing to check"
+    # refusal below, so that a hostBundle which could never adjudicate anything
+    # is reported as what it is rather than as a missing hostLibs.  Without
+    # this call the whole check was unreachable whenever hostLibs was empty:
+    # `hostBundle` was accepted, indexed never, and obvious garbage — a store
+    # path with no PE in it, a plain file — produced a green build and not one
+    # word of output.
+    pe_host_index
+    if [ -n "${HOST_BUNDLE:-}" ]; then
+      echo "  ERROR: hostBundle was given but hostLibs is empty, so there is" >&2
+      echo "  not one claim for it to check:" >&2
+      echo "      hostBundle = $HOST_BUNDLE" >&2
+      echo "  hostBundle exists to turn hostLibs entries into checked facts.  On" >&2
+      echo "  an empty list it can only report success about nothing, which is" >&2
+      echo "  the reading this argument was added to make impossible.  Either" >&2
+      echo "  declare the hostLibs this package relies on, or drop hostBundle." >&2
+      exit 1
+    fi
     echo "  Host-provided strip ($label): no hostLibs declared, so nothing is" \
          "treated as host-provided and the whole import closure is bundled."
     return 0
@@ -1092,6 +1258,17 @@ pe_strip_host_libs() {
       kept=$((kept + 1))
       continue
     fi
+    # The payload rule.  Named in the log rather than skipped quietly: a
+    # hostLibs entry that matches the package's own output is a caller mistake
+    # even when it is now harmless, and it is the one thing about this list
+    # that a reader cannot work out from the bundle afterwards.
+    if [ -n "${pe_payload["$f"]:-}" ]; then
+      kept=$((kept + 1))
+      payload_kept=$((payload_kept + 1))
+      echo "    = ${f#"$out"/}  (matches hostLibs, but this derivation's own" \
+           "build produced it — kept, and NOT claimed from the host)"
+      continue
+    fi
     pe_assert_host_provides "$b" "staged in this bundle at ${f#"$out"/}"
     rm -f "$f" || {
       echo "  ERROR: could not remove host-provided ${f#"$out"/}" >&2
@@ -1100,22 +1277,34 @@ pe_strip_host_libs() {
     # Both memos are keyed by path and both are now stale for it.
     unset 'pe_filetype_cache[$f]'
     unset 'pe_arch_cache[$f]'
+    # Recorded by PATH, because Phase 6 has to tell "this build deliberately
+    # removed bin/x.dll" from "Phase 1 lost bin/x.dll", and re-testing the NAME
+    # there answers the wrong question: under the payload rule a bin/ entry can
+    # match hostLibs and still be required to be present.
+    pe_stripped["$f"]=1
     removed=$((removed + 1))
     echo "    - ${f#"$out"/}  (host-provided)"
   done <<< "$files"
   pe_host_dropped_total=$((pe_host_dropped_total + removed))
+  pe_host_payload_total=$payload_kept
   echo "  Host-provided strip ($label): $examined PE(s) examined, $removed" \
-       "removed as host-provided, $kept kept"
-  # The floor.  An over-broad pattern — `*.dll` is the one that has actually
-  # been written — deletes the package's own payload, and every check after
-  # this point would then be measuring an empty bundle.  Phase 1c already
-  # refuses a Windows output with no PE in it; this is the same refusal for the
-  # tree AFTER the strip, which is the only place a strip bug can show up.
+       "removed as host-provided, $kept kept" \
+       "($payload_kept of them this derivation's own output)"
+  # The floor, and it is now a BACKSTOP rather than the primary guard.  What it
+  # was written for — an over-broad pattern such as `*.dll` eating the
+  # package's own payload — is what the payload rule above now refuses one file
+  # at a time, so on any derivation that produced a PE of its own this cannot
+  # fire.  It is kept because one shape has no payload by that reading: a
+  # derivation whose whole output is symlinks into other store paths.  There
+  # `hostLibs` still governs everything, and an over-broad list still empties
+  # the bundle.  Demonstrated firing on exactly that shape
+  # (tests/pe-hostlibs.nix, `stripEverythingLinked`), not asserted.
   if [ "$examined" -gt 0 ] && [ "$kept" -eq 0 ]; then
     echo "  ERROR: the hostLibs strip removed every PE in this bundle" \
          "($examined examined, $removed removed)." >&2
-    echo "  A pattern is matching this package's own payload, not the host's" >&2
-    echo "  runtime.  Nothing downstream of here would be measuring anything." >&2
+    echo "  Nothing this derivation's own build produced is in the bundle, so" >&2
+    echo "  the payload rule had nothing to protect and the patterns took the" >&2
+    echo "  whole tree.  Nothing downstream of here would be measuring anything." >&2
     exit 1
   fi
   # Directory maps are memoised behind pe_dir_scanned and files just left the
@@ -1221,21 +1410,6 @@ pe_sweep() {
       while IFS= read -r imp; do
         [ -n "$imp" ] || continue
         is_windows_system_dll "$imp" && continue
-        # hostLibs, at the IMPORT level.  The strip above removed the copies
-        # that were already here; this is what stops the closure putting them
-        # back, and it has to sit ahead of every directory test below — a
-        # host-provided name is not "missing from bin/", it is not this
-        # bundle's to carry, and treating it as missing is how the sweep would
-        # re-stage exactly what was just removed.
-        if pe_is_host_lib "$imp"; then
-          pe_assert_host_provides "$imp" "imported by ${root#"$out"/}"
-          if [ -z "${pe_host_import_logged["${imp,,}"]:-}" ]; then
-            pe_host_import_logged["${imp,,}"]=1
-            echo "    round $round  = $imp  <- ${root#"$out"/}  (host-provided;" \
-                 "not staged)"
-          fi
-          continue
-        fi
         key="${imp,,}"
         stage_dir="${app_dir:-$rootdir}"
         # bin/ first: that is the executable's own directory, which Windows
@@ -1311,6 +1485,28 @@ pe_sweep() {
             added=$((added + 1))
             echo "    round $round  ~ $beside_name  mirrored into bin/ from" \
                  "${rootdir#$out/} (was reachable only by the beside-the-importer rule)"
+          fi
+          continue
+        fi
+        # hostLibs, at the IMPORT level.  The strip above removed the copies
+        # that were already here; this is what stops the closure putting them
+        # back.
+        #
+        # It sits AFTER the two "already in the bundle" tests and BEFORE the
+        # closure lookup, and both halves of that placement are deliberate.
+        # After, because an import the bundle already satisfies is satisfied —
+        # under the payload rule a host-matched name can legitimately still be
+        # here (the derivation's own build produced it), and claiming it from
+        # the host as well would make the build fail over a DLL that is sitting
+        # right there.  Before, because a host-provided name is not "missing":
+        # left to the lookup it would be re-staged out of the closure, which is
+        # exactly what the strip had just undone.
+        if pe_is_host_lib "$imp"; then
+          pe_assert_host_provides "$imp" "imported by ${root#"$out"/}"
+          if [ -z "${pe_host_import_logged["${imp,,}"]:-}" ]; then
+            pe_host_import_logged["${imp,,}"]=1
+            echo "    round $round  = $imp  <- ${root#"$out"/}  (host-provided;" \
+                 "not staged)"
           fi
           continue
         fi
@@ -1920,12 +2116,24 @@ if [ "$IS_WINDOWS" = "1" ] && [ -n "$pe_app_dir" ]; then
     # name the same list had just matched — one list, two answers, in the same
     # phase.
     #
-    # Belt and braces now rather than the mechanism: the strip at the top of
-    # pass 1 has already removed any Qt DLL this list claims, so on the current
-    # ordering this cannot be reached with a host-claimed name.  It is kept
-    # because `qt_is_host` is read twice more below and a future reordering
-    # that puts detection before the first sweep must not silently change what
-    # those two reads mean.
+    # This arm is REACHED and it changes the verdict.  An earlier revision of
+    # this comment claimed the opposite — that the strip at the top of pass 1
+    # has already removed any Qt DLL the list claims, so a host-claimed name
+    # cannot get here — and that was false in two ways even then, and is more
+    # obviously false now:
+    #
+    #   * the strip only considers PEs (`pe_is_pe`), so a non-PE file named
+    #     `Qt6Core.dll` survives it and reaches this loop, which counts it for
+    #     DETECTION on purpose (see the `[ -e ]` note above); and
+    #   * under the payload rule the strip keeps a Qt-named DLL this
+    #     derivation's own build produced, which is precisely the shape a Qt
+    #     plugin package has.
+    #
+    # What happens when it does fire is the point: `qt_is_host=1` makes Phase
+    # 2b skip staging the Qt plugin and QML trees entirely.  On a bundle whose
+    # closure carries no Qt plugin directory that is the difference between a
+    # build and a hard error, which is how tests/pe-hostlibs.nix demonstrates
+    # the arm rather than asserting it.
     if pe_is_host_lib "$qt_lib_name"; then
       qt_is_host=1
     fi
@@ -3430,7 +3638,14 @@ if [ "$IS_WINDOWS" = "1" ]; then
       # The claim is still adjudicated, by pe_assert_host_provides at the point
       # the file was removed; all that happens here is that it is not counted
       # twice.
-      if pe_is_host_lib "$n"; then
+      #
+      # `pe_stripped`, keyed by PATH, and not `pe_is_host_lib "$n"`.  Re-asking
+      # the name answers a question this arm is not allowed to ask any more:
+      # under the payload rule a bin/ entry can match hostLibs and still have
+      # been KEPT, and a name test would then wave through its disappearance as
+      # deliberate when nothing deliberate happened to it.  The only losses
+      # this arm may excuse are the ones this build performed.
+      if [ -n "${pe_stripped["$out/bin/$n"]:-}" ]; then
         win_host_bin=$((win_host_bin + 1))
         continue
       fi
@@ -3502,25 +3717,6 @@ if [ "$IS_WINDOWS" = "1" ]; then
       [ -n "$imp" ] || continue
       win_import_names=$((win_import_names + 1))
       is_windows_system_dll "$imp" && continue
-      # A host-claimed name counts as RESOLVED, and it has to be adjudicated
-      # here rather than left to the "in neither its own directory nor bin/ nor
-      # the closure" arm below.  Without this, the strip and the verifier are
-      # two halves of one decision that disagree: the strip removes Qt6Core.dll
-      # on the caller's say-so and Phase 6 then fails the build over the very
-      # DLL it was told not to carry.  That is why the strip cannot land on its
-      # own.
-      #
-      # `pe_assert_host_provides`, not a bare `continue`: this is the last
-      # place the claim is visible, and on a bundle where the strip removed
-      # nothing (the DLL was never staged in the first place — the ordinary
-      # module-with-no-linkDLLsInfolder shape) it is the ONLY place.  A silent
-      # continue here would let an unverifiable claim through on exactly the
-      # shape where nothing else looks at it.
-      if pe_is_host_lib "$imp"; then
-        pe_assert_host_provides "$imp" "imported by ${f#"$out"/}"
-        win_host_imports=$((win_host_imports + 1))
-        continue
-      fi
       key="${imp,,}"
       # Which FILE satisfies it, not merely whether something does: the
       # architecture check below needs the provider, and asking for it is what
@@ -3533,6 +3729,39 @@ if [ "$IS_WINDOWS" = "1" ]; then
         hit="$pe_app_dir/${pe_dir_have["$pe_app_dir|$key"]}"
       fi
       if [ -z "$hit" ]; then
+        # A host-claimed name counts as RESOLVED, and it has to be adjudicated
+        # here rather than left to the "in neither its own directory nor bin/
+        # nor the closure" error below.  Without this arm the strip and the
+        # verifier are two halves of one decision that disagree: the strip
+        # removes Qt6Core.dll on the caller's say-so and Phase 6 then fails the
+        # build over the very DLL it was told not to carry.  That is why the
+        # strip cannot land on its own.
+        #
+        # Inside the `-z "$hit"` branch, not ahead of it: an import the bundle
+        # actually satisfies is resolved and gets the architecture check below,
+        # whatever hostLibs says about the name.  Under the payload rule that
+        # case is real — a Qt-named DLL the derivation itself produced stays in
+        # the bundle — and adjudicating it as a host claim would fail the build
+        # over a file that is present.
+        #
+        # `pe_assert_host_provides`, not a bare `continue`, because a name that
+        # reaches here is one nothing in the bundle satisfies: the build ships
+        # on the strength of the claim alone, so this is the last point at
+        # which it can be refused.  An earlier revision justified it by calling
+        # this the ONLY place a claim is visible on the
+        # module-with-no-linkDLLsInfolder shape.  It is not: that shape is
+        # `moduleClaimedOnly` in tests/pe-hostlibs.nix, and its own build log
+        # shows the sweep's import arm reporting the same name one phase
+        # earlier ("(host-provided; not staged)"), calling the same assertion.
+        # The two arms are not redundant — the sweep only sees imports of roots
+        # it walks, Phase 6 re-reads every PE in the finished tree — but
+        # neither is the sole witness, and the reason to adjudicate here does
+        # not need it to be.
+        if pe_is_host_lib "$imp"; then
+          pe_assert_host_provides "$imp" "imported by ${f#"$out"/}"
+          win_host_imports=$((win_host_imports + 1))
+          continue
+        fi
         echo "  ERROR: ${f#"$out"/} imports $imp, which is in neither its own" \
              "directory nor${app_present:+ bin/ nor} the closure" >&2
         win_errors=$((win_errors + 1))
@@ -3635,10 +3864,22 @@ if [ "$IS_WINDOWS" = "1" ]; then
     # a wrong-namespace list looks like (Unix globs on a PE bundle: `libz*`
     # against `zlib1.dll`), and that has to be visible rather than read as "the
     # strip ran".
-    echo "  hostLibs was declared but matched nothing in this bundle: no file" \
-         "was dropped and no import was assigned to the host.  If that is a" \
-         "surprise, check the spelling — a PE bundle needs Windows file names" \
-         "(\`zlib1.dll\`), and a Unix pattern like \`libz*\` cannot match one."
+    if [ "$pe_host_payload_total" -gt 0 ]; then
+      # A different situation with the same empty ledger, and it must not read
+      # as the wrong-spelling one: the patterns DID match, on files this
+      # derivation produced, and the payload rule kept every one of them.
+      echo "  hostLibs matched $pe_host_payload_total file(s) that this" \
+           "derivation's own build produced, and kept all of them — see the" \
+           "\`=\` lines in the strip above.  Nothing was dropped and nothing" \
+           "was assigned to the host, so there is no claim to verify.  A" \
+           "hostLibs entry that matches the package's own payload is a caller" \
+           "mistake even though it is now harmless."
+    else
+      echo "  hostLibs was declared but matched nothing in this bundle: no file" \
+           "was dropped and no import was assigned to the host.  If that is a" \
+           "surprise, check the spelling — a PE bundle needs Windows file names" \
+           "(\`zlib1.dll\`), and a Unix pattern like \`libz*\` cannot match one."
+    fi
   fi
   echo "  NOT checked (uncheckable statically): DLLs loaded by a name computed" \
        "at runtime.  Those are covered only by the directory presence checks" \

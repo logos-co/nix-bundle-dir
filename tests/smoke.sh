@@ -7,9 +7,11 @@
 # /nix/store paths, or quietly go back to running everything through ld.so.
 # Every assertion below corresponds to something that has actually gone wrong.
 #
-# Two sections. The extraDirs contract runs everywhere, because the bug it
-# guards was platform-independent; everything after the arch gate is ELF, and
-# a non-Linux host stops there rather than pretending it checked.
+# Three sections. The extraDirs contract runs everywhere, because the bug it
+# guards was platform-independent; the Windows/PE hostLibs contract runs on
+# x86_64-linux only and says so out loud when it does not; everything after the
+# arch gate is ELF, and a non-Linux host stops there rather than pretending it
+# checked.
 #
 # Two subjects for the ELF section, chosen to be tiny so this stays cheap:
 #   hello         via qtCliApp -- the plain path, no launcher
@@ -83,6 +85,65 @@ elif grep -q 'ERROR: share/probe/libdirty' dirty.log; then
 else
   bad "Phase 6 looks INSIDE a nested extraDirs entry" \
       "it failed without Phase 6 naming the file: $(grep -m1 -E 'cp: cannot|error:' dirty.log)"
+fi
+
+echo
+
+# == the Windows/PE hostLibs contract ========================================
+#
+# This block exists because the contract in tests/pe-hostlibs.nix was reachable
+# only through `nix flake check`, and CI does not run `nix flake check` — it
+# runs this file. Ten subjects that must build and eight that must be refused
+# were therefore built by nobody, which is the same as not having them.
+#
+# x86_64-linux only, and by SYSTEM rather than by `uname`: every subject is a
+# pkgsCross.mingwW64 build, substitutable there and an hours-long GCC bootstrap
+# on aarch64. Skipping is announced, so a green run on the arm runner cannot be
+# read as "the PE contract passed".
+if [ "$SYS" = "x86_64-linux" ]; then
+  echo "== Windows/PE hostLibs contract =="
+
+  # Must BUILD. Each asserts the resulting PE SET, not a count: the defect
+  # class here is a bundle that is missing a file and exits 0.
+  for c in pe-hostlibs-module pe-hostlibs-module-verified pe-hostlibs-claimed-only \
+           pe-hostlibs-app pe-hostlibs-mixed-case pe-hostlibs-payload-wildcard \
+           pe-hostlibs-payload-copies pe-hostlibs-payload-extradirs \
+           pe-hostlibs-payload-qt pe-hostlibs-payload-qt-unverified; do
+    if nix build -L "$FLAKE#checks.$SYS.$c" --no-link > "pe-$c.log" 2>&1; then
+      ok "$c"
+    else
+      bad "$c" "$(grep -m1 -E 'ERROR:|FAIL |error:' "pe-$c.log")"
+    fi
+  done
+
+  # Must FAIL, and each on a DIFFERENT arm, so the message is the assertion.
+  # A subject that fails for the wrong reason is the failure this whole file is
+  # written against, and exit status alone cannot tell the two apart.
+  #
+  # Pairs of "attribute<TAB>expected fragment".
+  while IFS='|' read -r c want; do
+    [ -n "$c" ] || continue
+    if nix build -L "$FLAKE#tests.$SYS.$c" --no-link > "pe-$c.log" 2>&1; then
+      bad "$c is refused" "it built"
+    elif grep -qF "$want" "pe-$c.log"; then
+      ok "$c is refused, by the right arm"
+    else
+      bad "$c is refused, by the right arm" \
+          "expected '$want'; got: $(grep -m1 -E 'ERROR:|error:' "pe-$c.log")"
+    fi
+  done <<'PE_FAILS'
+pe-hostlibs-claim-broken|ERROR: hostLibs claims the host provides libgcc_s_seh-1.dll
+pe-hostlibs-host-vacuous|has no PE file in its
+pe-hostlibs-host-no-libs|ERROR: hostBundle was given but hostLibs is empty
+pe-hostlibs-host-no-libs-garbage|has no PE file in its
+pe-hostlibs-host-on-unix|whose target Nix reports as
+pe-hostlibs-strip-everything|ERROR: the hostLibs strip removed every PE in this bundle
+pe-hostlibs-qt-not-host|no Qt plugin directory for this
+pe-hostlibs-unclaimed|DLL import(s) could not be resolved
+PE_FAILS
+else
+  echo "== Windows/PE hostLibs contract: SKIPPED on $SYS =="
+  echo "   (every subject is a pkgsCross.mingwW64 build; only x86_64-linux runs them)"
 fi
 
 echo

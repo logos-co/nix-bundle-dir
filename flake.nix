@@ -48,6 +48,12 @@
           pe-hostlibs-claimed-only    = peHostLibs.moduleClaimedOnly;
           pe-hostlibs-app             = peHostLibs.appStripped;
           pe-hostlibs-mixed-case      = peHostLibs.moduleStrippedMixedCase;
+          # The payload rule: what the strip may NOT remove.
+          pe-hostlibs-payload-wildcard = peHostLibs.payloadSurvivesWildcard;
+          pe-hostlibs-payload-copies   = peHostLibs.payloadCopiesKept;
+          pe-hostlibs-payload-extradirs = peHostLibs.extraDirsPayloadKept;
+          pe-hostlibs-payload-qt        = peHostLibs.qtPayloadKept;
+          pe-hostlibs-payload-qt-unverified = peHostLibs.qtPayloadKeptUnverified;
         });
 
       # Subjects that MUST fail to build. Kept out of `checks` on purpose:
@@ -71,8 +77,11 @@
         // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
           pe-hostlibs-claim-broken     = peHostLibs.hostClaimBroken;
           pe-hostlibs-host-vacuous     = peHostLibs.hostBundleVacuous;
-          pe-hostlibs-strip-everything = peHostLibs.stripEverything;
-          pe-hostlibs-strip-everything-bare = peHostLibs.stripEverythingBare;
+          pe-hostlibs-host-no-libs     = peHostLibs.hostBundleWithoutHostLibs;
+          pe-hostlibs-host-no-libs-garbage = peHostLibs.hostBundleGarbageIgnored;
+          pe-hostlibs-host-on-unix     = peHostLibs.hostBundleOnUnix;
+          pe-hostlibs-strip-everything = peHostLibs.stripEverythingLinked;
+          pe-hostlibs-qt-not-host      = peHostLibs.qtPayloadNotHostProvided;
           pe-hostlibs-unclaimed        = peHostLibs.moduleUnclaimed;
         });
 
@@ -121,6 +130,18 @@
               warnOnBinaryData = true;
               guiApp = false;
             };
+          # A Qt plugin is loaded INTO a Qt host, so the Qt runtime is the
+          # host's, and this bundler says so on the caller's behalf.
+          #
+          # Note what that appended `Qt*` is: a pattern the BUNDLER writes,
+          # which the caller never sees and cannot review. On the PE path the
+          # match folds case on both sides, so it reads `qt*` and matches the
+          # plugin's own `qtquick2plugin.dll` as readily as `Qt6Core.dll` —
+          # measured on the real Windows Qt bundle, before the payload rule
+          # existed, as 816 PE files in and 796 out with exit 0. It is only
+          # sound to inject a pattern here because `pe_strip_host_libs` can no
+          # longer remove anything the bundled derivation's own build produced.
+          # Do not widen this without re-reading that rule.
           qtPlugin = drv:
             mkBundle {
               inherit drv;

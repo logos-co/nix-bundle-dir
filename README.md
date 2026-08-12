@@ -61,8 +61,7 @@ Windows/PE included:
 mkBundle {
   drv = myModule;
   # Written in the TARGET's own spelling. There is one list, not one per
-  # platform, and the two spellings do not transfer: `libz*` never matches
-  # `zlib1.dll`, `libcrypto*` never matches `libcrypto-3-x64.dll`.
+  # platform.
   hostLibs = [ "Qt*.dll" "libstdc++-*.dll" "libgcc_s_*.dll" "zlib1.dll" ];
 
   # Optional, PE only: the host's own bundle. Every name the bundler drops (or
@@ -76,12 +75,30 @@ mkBundle {
 Both bundle shapes are supported: an application (`bin/`) and a module whose
 whole output is `lib/<name>.dll`.
 
+**What `hostLibs` may remove.** On ELF and Mach-O it filters what the bundler
+*adds*: a traced dependency matching the list is not copied in. On Windows the
+bundler also has to *delete*, because nixpkgs' `win-dll-link.sh` has already
+staged the import closure into the derivation's own output before the bundler
+sees it. Deleting is the more dangerous operation, so it is bounded by a
+provenance rule: **the strip may only remove a file that came along with the
+package** — one the bundler staged, or one `win-dll-link.sh` linked in from
+another store path — **never a file the derivation's own build produced.** A
+Qt plugin package bundled with `hostLibs = [ "Qt*" ]` therefore loses the Qt
+runtime DLLs and keeps `qtquick2plugin.dll`, and a DLL the caller carried in
+via `extraDirs` is never touched.
+
+Do not read anything into the shape of the patterns. Cross-platform spellings
+*can* over-match — `libcrypto*` matches `libcrypto-3-x64.dll` — and the safety
+comes from the payload rule, from `hostBundle`, and from the build failing when
+a strip would empty the bundle.
+
 Every `hostLibs` entry is a promise about another package's output, and on
 Windows a broken promise is silent — `LoadLibrary` fails with
 `ERROR_MOD_NOT_FOUND` (126) and Qt reports only "The specified module could not
 be found", naming the *plugin* rather than the DLL that is absent. `hostBundle`
 turns that promise into a build-time check; without it the build still works and
-the log lists every claim, marked `UNVERIFIED`.
+the log lists every claim, marked `UNVERIFIED`. Passing `hostBundle` with an
+empty `hostLibs`, or on a non-Windows target, is refused rather than ignored.
 
 ## Caveats
 
