@@ -10,6 +10,12 @@ name: CI
 # The cross-distro run is the point of doing this in CI rather than locally:
 # the whole promise is "runs on a distro that is not the build host", and the
 # interpreter path is exactly where that promise has failed before.
+#
+# smoke.sh is the ONLY thing this workflow runs, which is why every contract
+# has to be reachable from it. `nix flake check` is never invoked here, so a
+# subject wired only into `checks` is built by nobody — that is what happened
+# to the whole Windows/PE hostLibs contract, and smoke.sh now builds it (on the
+# x86_64 runner; the arm runner reports the skip).
 
 on:
   push:

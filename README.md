@@ -50,6 +50,118 @@ in bundle
 
 See [mkBundle.nix](mkBundle.nix) for the full interface.
 
+### Libraries the host already ships (`hostLibs`, `hostBundle`)
+
+A bundle that is loaded *into* another program — a plugin, a module installed
+next to a host application — should not carry a second copy of the runtime that
+host already provides. `hostLibs` is that list, and it applies on every target,
+Windows/PE included:
+
+```nix
+mkBundle {
+  drv = myModule;
+  # Written in the TARGET's own spelling. There is one list, not one per
+  # platform.
+  hostLibs = [ "Qt*.dll" "libstdc++-*.dll" "libgcc_s_*.dll" "zlib1.dll" ];
+
+  # Optional, PE only: the host's own bundle. Every name the bundler drops (or
+  # accepts as the host's to satisfy) must be in that tree's application
+  # directory — `bin/` if it has one, else the root — because that is the
+  # directory Windows searches for the loading process.
+  hostBundle = myHostApp;
+}
+```
+
+**Only for a bundle that is loaded into something else.** On Windows a
+host-provided DLL is found because the loader searches the *loading process's*
+own directory. That is the host's directory when this bundle is a module
+(`lib/<name>.dll`, no executable of its own) and it is the directory *this*
+bundle's `.exe` sits in when the bundle has one — where the stripped DLLs no
+longer are. So a `hostLibs` claim on a bundle that ships an executable is
+**refused at build time**, wherever in the bundle that executable is: the check
+is "does any PE in this tree have an executable image header", not "is there an
+`.exe` in `bin/`". Measured: such a bundle dies with `0xC0000135` before
+`main()` and prints nothing. It runs only if the deployment puts the host's
+`bin\` somewhere the loader searches for that *process* — prepended to `PATH`,
+or as the current directory, which is in the EXE search order too — and that is
+not something a build-time check can see.
+
+**What `hostLibs` may remove.** On ELF and Mach-O it filters what the bundler
+*adds*: a traced dependency matching the list is not copied in. On Windows the
+bundler also has to *delete*, because nixpkgs' `win-dll-link.sh` has already
+staged the import closure into the derivation's own output before the bundler
+sees it. Deleting is the more dangerous operation, so it is bounded by *who
+declared what*:
+
+- **A pattern you write deletes.** `hostLibs = [ "Qt*" ]` on a Qt plugin package
+  removes that package's own `Qt6*.dll` too. That is the contract, not an
+  accident — and `hostBundle` is how you make it checkable.
+- **No bundler in this repo injects one that does.** `bundlers.<sys>.qtPlugin`
+  appends `Qt*` for you, and only on non-Windows targets, where `hostLibs`
+  cannot delete anything. That is a statement about this repo's bundlers, not
+  about every caller: `nix-bundle-lgx` injects a list of its own and is kept off
+  this path by routing rather than by rule.
+- **Nothing is removed from `extraDirs`.** Those directories are named by you,
+  one by one, as "carry this"; a name glob does not overrule that. Note the
+  guarantee is one-directional: the sweep may still STAGE a dependency into a
+  declared directory when the importer lives there, which is what makes such a
+  bundle loadable.
+- **A strip that would empty the bundle fails the build.**
+
+Do not read anything into the shape of the patterns. Cross-platform spellings
+*can* over-match — `libcrypto*` matches `libcrypto-3-x64.dll` — and the safety
+comes from the rules above, from `hostBundle`, and from the log naming every
+dropped file.
+
+**The host must also LOOK there.** A stripped module finds the host's DLLs
+because Windows searches the *loading process's own directory*, and some
+`LoadLibraryEx` flags remove precisely that directory from the search.
+
+Measured on Windows 11 x86-64 (AMD64) against the **real**
+`logos-package_manager-module` — `packages.x86_64-windows.lib`, bundled by this
+bundler: 19 PEs examined, 16 removed, 3 kept — a host bundle shipping those 16
+in its `bin\`, and the *unstripped* bundle of the same module as the control.
+The loading process's current directory is a scratch directory holding none of
+the DLLs unless a row says otherwise:
+
+| flags | what it means | stripped | control | what the pair says |
+|---|---|---|---|---|
+| `0x1100` | `…DLL_LOAD_DIR｜…DEFAULT_DIRS` | **loads** | loads | the mode Logos uses; the strip is invisible |
+| `0x0008` | `LOAD_WITH_ALTERED_SEARCH_PATH` | fails, 126 | **loads** | the strip, and only the strip |
+| `0x0008` | same, CWD = the host's own `bin\` | **loads** | — | the current directory is still in that order |
+| `0x0000` | default search order | fails, 126 | fails, 126 | *not* the strip |
+| `0x0100` | `…SEARCH_DLL_LOAD_DIR` alone | fails, 126 | fails, 126 | *not* the strip |
+| `0x1000` | `…SEARCH_DEFAULT_DIRS` alone | fails, 126 | fails, 126 | *not* the strip |
+| `0x1100` | host missing one claimed DLL | fails, 126 | **loads** | the claim is load-bearing |
+
+`0x1100` is what logos-module's `preloadPluginWithOwnDirSearch`
+(`src/win_dll_search.h`) passes, which is why Logos modules may be stripped.
+
+Read the table as a statement about which directories a mode searches, not as
+one verdict per flag — the three "not the strip" rows are why. A real module
+keeps private DLLs of its own beside it, and the default order does not search a
+loaded DLL's own directory at all, so `0x0000` fails on the *unstripped* bundle
+too; `0x0100` and `0x1000` each name only half of what is needed. And `0x0008`
+replaces the application directory while leaving the rest of the standard order
+in place, current directory included — so the same host, started from its own
+`bin\`, loads the same stripped module through `0x0008`.
+
+(An earlier revision of this table was measured on a synthetic single-DLL module
+and reported `0x0000` as loading. That is true only for a module with no private
+dependencies of its own, which no real Logos module is.)
+
+Nothing at build time can see which mode a host will use, or where it will be
+started from, so this is a property of the host you must check once, by hand —
+`hostBundle` checks that the DLL is *there*, not that anyone will look.
+
+Every `hostLibs` entry is a promise about another package's output, and on
+Windows a broken promise is silent — `LoadLibrary` fails with
+`ERROR_MOD_NOT_FOUND` (126) and Qt reports only "The specified module could not
+be found", naming the *plugin* rather than the DLL that is absent. `hostBundle`
+turns that promise into a build-time check; without it the build still works and
+the log lists every claim, marked `UNVERIFIED`. Passing `hostBundle` with an
+empty `hostLibs`, or on a non-Windows target, is refused rather than ignored.
+
 ## Caveats
 
 - **Graphics/OpenGL on Linux.** GPU driver libraries (`libGL`, `libEGL`, `libvulkan`, etc.) are excluded by default because they must match the host's hardware drivers. This is the same [well-known problem](https://github.com/NixOS/nixpkgs/issues/9415) that affects AppImages and other bundling approaches. You may need [nixGL](https://github.com/nix-community/nixGL) or similar.

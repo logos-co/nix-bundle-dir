@@ -3,7 +3,130 @@
 { drv
 , name ? drv.pname or drv.name or "bundle"
 , systemLibs ? []
+# Libraries the RUNTIME HOST already provides, which this bundle must therefore
+# not carry. Applied on every target: ELF, Mach-O and — since this argument
+# started being honoured on the PE path — Windows.
+#
+# ONE list for all three, with the caller writing the spelling that matches the
+# target's own file names. What a caller writes for a Logos module bundled for
+# Windows:
+#
+#   hostLibs = [ "Qt*.dll" "libcrypto-*.dll" "libssl-*.dll"
+#                "libstdc++-*.dll" "libgcc_s_*.dll" "zlib1.dll" ... ];
+#   hostBundle = logos-basecamp.packages.x86_64-windows.default;
+#
+# and for the same module on Linux:
+#
+#   hostLibs = [ "libQt*" "libcrypto.so*" "libssl.so*" "libz.so*" ... ];
+#
+# The spellings do not transfer and are not meant to. A previous version of
+# this comment went further and claimed a list written for the wrong platform
+# can only strip LESS than intended — "`libcrypto*` never matches
+# `libcrypto-3-x64.dll`" — which is simply false: it matches. Some Unix
+# spellings do under-match (`libz*` cannot match `zlib1.dll`), but nothing in
+# this design may rest on that.
+#
+# WHAT THE PE PATH MAY DELETE. On ELF and Mach-O this list only filters what
+# `trace_deps` copies IN; on Windows the import closure is already inside the
+# derivation's output (nixpkgs' win-dll-link.sh stages it during fixup), so the
+# bundler has to delete, and deleting is the more dangerous operation. It is
+# bounded by WHO DECLARED WHAT, and infers nothing about a file:
+#
+#   * a pattern the CALLER wrote deletes. `hostLibs = [ "Qt*" ]` on a Qt plugin
+#     package removes that package's own Qt6*.dll, and that is the contract;
+#   * no bundler in THIS repo injects a pattern that reaches the PE path — see
+#     `bundlers.<sys>.qtPlugin` in flake.nix, which appends `Qt*` only on a
+#     non-Windows target.  That is not a census of every caller: nix-bundle-lgx
+#     injects its own list and is kept off this path by routing, not by rule;
+#   * nothing is REMOVED from `extraDirs` -- those directories are named by the
+#     caller, one by one, as "carry this".  One-directional: the sweep may still
+#     STAGE a dependency into one when the importer lives there;
+#   * and what does go is checked (`hostBundle`) or listed by name in the log
+#     as UNVERIFIED, so an over-broad list is loud rather than silent.
+#
+# An earlier revision bounded the strip by PROVENANCE instead — a regular file
+# in the derivation's output is its own build product, a symlink is a dependency
+# travelling with it — which is recorded because it reads well and does not
+# work: in the real `logos-package_manager-module` Windows lib/, 8 of 19 DLLs
+# (icudt76, icuuc76, libstdc++-6, libgcc_s_seh-1, libmcfgthread-2, libsodium-26
+# and more) are REGULAR FILES, so on the shape this feature exists for it kept
+# everything and stripped nothing.
+#
+# See the long note above `pe_is_host_lib` in bundle.sh for why the LIST is
+# shared and only the MATCH is platform-specific.
 , hostLibs ? []
+# The host's own assembled bundle, used to CHECK `hostLibs` rather than take it
+# on trust. PE path only.
+#
+# Every hostLibs entry is a promise about another repo's output, and on Windows
+# a broken promise is silent: the module fails to load with ERROR_MOD_NOT_FOUND
+# (126) and Qt reports only "The specified module could not be found", naming
+# the plugin rather than the DLL that is absent. Point this at the tree the
+# host process actually runs from and every name the bundler drops — or accepts
+# as the host's to satisfy — has to be present in that tree's application
+# directory (`bin/` if it has one, else the root, one level deep, because that
+# is the directory Windows searches for the loading process).
+#
+# Left null the strip still happens and the claims are listed in the log,
+# flagged UNVERIFIED. Optional rather than required because a module package's
+# host can be a repo it has no other reason to depend on, and making this
+# mandatory would put the strip out of reach of the packages that need it most.
+#
+# Passing it with an EMPTY hostLibs is refused by bundle.sh rather than
+# ignored: there is no claim for it to check, so it could only report success
+# about nothing.
+#
+# What it CANNOT check is the other half of the promise: that the host will
+# look in its own directory when it loads this module. Measured on Windows 11
+# x86-64 (AMD64) against the REAL logos-package_manager-module —
+# `packages.x86_64-windows.lib`, bundled by this bundler: 19 PEs examined, 16
+# removed, 3 kept — and a host bundle shipping those 16 in its bin\, with the
+# UNSTRIPPED bundle of the same module as the control and the process's CURRENT
+# DIRECTORY a scratch directory holding none of them:
+#
+#                                          stripped   control
+#   flags 0x1100 DLL_LOAD_DIR|DEFAULT_DIRS  LOADS      LOADS
+#   flags 0x0008 ALTERED_SEARCH_PATH        126        LOADS   <- the strip
+#   flags 0x0008, CWD = the host's bin\     LOADS      -
+#   flags 0x0000 (default order)            126        126     <- not the strip
+#   flags 0x0100 SEARCH_DLL_LOAD_DIR alone  126        126     <- not the strip
+#   flags 0x1000 SEARCH_DEFAULT_DIRS alone  126        126     <- not the strip
+#   flags 0x1100, host missing one claim    126        LOADS   <- the claim
+#
+# logos-module passes 0x1100 (src/win_dll_search.h), which is the row that
+# matters. Only the rows where the CONTROL differs are attributable to the strip
+# at all: 0x0008 and the missing-claim row. The three marked "not the strip"
+# fail identically on a module this bundler never touched, so they are facts
+# about which directories each mode searches and about a real module's own
+# private DLLs — quoting one of them as a verdict on hostLibs is how the
+# previous version of this table got 0x0000 wrong. That version was measured on
+# a synthetic module with no private dependencies; a real module keeps its own
+# DLLs beside it, which the default order never searches.
+#
+# The CWD qualifier is load-bearing too: 0x0008 substitutes the module's
+# directory for the application's and leaves the rest of the standard order —
+# CURRENT DIRECTORY included — in place, so the same host launched from its own
+# bin\ loads the same stripped module through 0x0008.
+#
+# And it only applies to a MODULE. A bundle with an executable of its own is
+# refused by bundle.sh the moment hostLibs would drop anything — an executable
+# ANYWHERE in the bundle, not only one in bin\, which is what that scan looked
+# at while this sentence already said otherwise. For that shape the loading
+# process is the bundle's own .exe and the directory Windows searches is the one
+# that .exe sits in — the host's DLLs are not there, and this argument would be
+# verifying a directory the loader never consults. Measured: such a bundle run
+# from its own directory dies 0xC0000135 with no output, and runs only when the
+# deployment puts the host's bin\ where the loader looks for that process (on
+# PATH, or as the current directory).
+#
+# Not consulted on ELF/Mach-O, and refused there rather than silently dropped —
+# see the `throwIf` below.  Measured rather than asserted: across the
+# non-Windows subject set this branch is A/B'd on, every output tree and every
+# build log is byte-identical to origin/main, with a null-change control used to
+# attribute log noise.  That is evidence over those subjects, not a proof over
+# all inputs.  Extending the check to ELF/Mach-O is a separate change with its
+# own evidence.
+, hostBundle ? null
 , extraDirs ? []
 , extraClosurePaths ? []
 , useDefaultSystemLibs ? true
@@ -186,9 +309,32 @@ let
   ];
 
   allSystemLibs = (if useDefaultSystemLibs then defaultSystemLibs else []) ++ systemLibs;
+
+  # `hostBundle` is a PE-path argument. Where Nix already KNOWS the target is
+  # not Windows, refuse at evaluation time rather than accept the argument and
+  # consult it nowhere: an argument that is silently ignored is the defect
+  # shape this file spends its length refusing, and this one was ignored on
+  # every non-PE bundle and on every PE bundle with an empty hostLibs.
+  #
+  # `isWindowsStr == "0"` only — not `!= "1"`. On "unknown" Nix has no answer
+  # to give and bundle.sh resolves the target in Phase 1c; that case is refused
+  # there, after the resolution, which is the only place it can be judged.
+  checkHostBundle = out:
+    pkgs.lib.throwIf (hostBundle != null && isWindowsStr == "0") ''
+      mkBundle: hostBundle was given for ${name}, whose target Nix reports as
+      non-Windows (drv.stdenv.hostPlatform.isWindows = false).
+
+      hostBundle checks hostLibs claims against the directory the WINDOWS
+      loader searches for the host process. There is no such directory on ELF
+      or Mach-O, so nothing would consult it and the argument would be a
+      declaration with no effect.
+
+      Drop hostBundle for this target, or pass windowsTarget = true if this
+      really is a Windows tree whose derivation carries no stdenv to read.
+    '' out;
 in
 
-pkgs.stdenv.mkDerivation {
+checkHostBundle (pkgs.stdenv.mkDerivation {
   pname = "${name}-bundle";
   version = drv.version or "0";
 
@@ -238,6 +384,11 @@ pkgs.stdenv.mkDerivation {
   PE_OBJDUMP = peObjdump;
   SYSTEM_LIBS = builtins.concatStringsSep "\n" allSystemLibs;
   HOST_LIBS = builtins.concatStringsSep "\n" hostLibs;
+  # Empty string, not an absent variable, so bundle.sh's `${HOST_BUNDLE:-}`
+  # tests read the same on every platform. Interpolating the derivation is what
+  # puts it in the build's inputs, which is required: the bundler reads the
+  # host's tree at build time.
+  HOST_BUNDLE = if hostBundle == null then "" else "${hostBundle}";
   EXTRA_DIRS = builtins.concatStringsSep "\n" extraDirs;
   WARN_ON_BINARY_DATA = if warnOnBinaryData then "1" else "0";
   GUI_APP = if guiApp then "1" else "0";
@@ -247,4 +398,4 @@ pkgs.stdenv.mkDerivation {
   '';
 
   installPhase = "true";
-}
+})
