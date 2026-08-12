@@ -3,7 +3,52 @@
 { drv
 , name ? drv.pname or drv.name or "bundle"
 , systemLibs ? []
+# Libraries the RUNTIME HOST already provides, which this bundle must therefore
+# not carry. Applied on every target: ELF, Mach-O and — since this argument
+# started being honoured on the PE path — Windows.
+#
+# ONE list for all three, with the caller writing the spelling that matches the
+# target's own file names. What a caller writes for a Logos module bundled for
+# Windows:
+#
+#   hostLibs = [ "Qt*.dll" "libcrypto-*.dll" "libssl-*.dll"
+#                "libstdc++-*.dll" "libgcc_s_*.dll" "zlib1.dll" ... ];
+#   hostBundle = logos-basecamp.packages.x86_64-windows.default;
+#
+# and for the same module on Linux:
+#
+#   hostLibs = [ "libQt*" "libcrypto.so*" "libssl.so*" "libz.so*" ... ];
+#
+# The spellings do not transfer and are not meant to: `libz*` never matches
+# `zlib1.dll`, `libcrypto*` never matches `libcrypto-3-x64.dll`. A list written
+# for the wrong platform therefore strips LESS than intended rather than more,
+# which on Windows is inert (a duplicate of a DLL the host has already loaded
+# is never consulted) where the opposite is fatal. bundle.sh says so in the log
+# when a declared list matches nothing at all. See the long note above
+# `pe_is_host_lib` in bundle.sh for why the LIST is shared and only the MATCH
+# is platform-specific.
 , hostLibs ? []
+# The host's own assembled bundle, used to CHECK `hostLibs` rather than take it
+# on trust. PE path only.
+#
+# Every hostLibs entry is a promise about another repo's output, and on Windows
+# a broken promise is silent: the module fails to load with ERROR_MOD_NOT_FOUND
+# (126) and Qt reports only "The specified module could not be found", naming
+# the plugin rather than the DLL that is absent. Point this at the tree the
+# host process actually runs from and every name the bundler drops — or accepts
+# as the host's to satisfy — has to be present in that tree's application
+# directory (`bin/` if it has one, else the root, one level deep, because that
+# is the directory Windows searches for the loading process).
+#
+# Left null the strip still happens and the claims are listed in the log,
+# flagged UNVERIFIED. Optional rather than required because a module package's
+# host can be a repo it has no other reason to depend on, and making this
+# mandatory would put the strip out of reach of the packages that need it most.
+#
+# Not consulted on ELF/Mach-O: those paths are unchanged by this argument, down
+# to the byte, and extending the check to them is a separate change with its
+# own evidence.
+, hostBundle ? null
 , extraDirs ? []
 , extraClosurePaths ? []
 , useDefaultSystemLibs ? true
@@ -238,6 +283,11 @@ pkgs.stdenv.mkDerivation {
   PE_OBJDUMP = peObjdump;
   SYSTEM_LIBS = builtins.concatStringsSep "\n" allSystemLibs;
   HOST_LIBS = builtins.concatStringsSep "\n" hostLibs;
+  # Empty string, not an absent variable, so bundle.sh's `${HOST_BUNDLE:-}`
+  # tests read the same on every platform. Interpolating the derivation is what
+  # puts it in the build's inputs, which is required: the bundler reads the
+  # host's tree at build time.
+  HOST_BUNDLE = if hostBundle == null then "" else "${hostBundle}";
   EXTRA_DIRS = builtins.concatStringsSep "\n" extraDirs;
   WARN_ON_BINARY_DATA = if warnOnBinaryData then "1" else "0";
   GUI_APP = if guiApp then "1" else "0";

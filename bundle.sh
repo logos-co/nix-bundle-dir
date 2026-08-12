@@ -886,6 +886,251 @@ pe_dir_index() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# hostLibs on the PE path — what the RUNTIME HOST already ships
+# ---------------------------------------------------------------------------
+# ONE `hostLibs` argument serves both platforms; the caller writes the spelling
+# that matches the TARGET's own file names.  Not a second `windowsHostLibs`
+# argument, and the reason is not tidiness:
+#
+#   * A bundle has exactly one target, and mkBundle reads it off the bundled
+#     derivation's own stdenv — so the caller that wrote `hostLibs` already
+#     knows which spelling it needs.  A second argument only adds a way to fill
+#     in the one that is not consulted, and an argument that is silently
+#     ignored is the exact defect shape this file spends its length refusing.
+#   * The two spellings do not collide in the dangerous direction.  Unix globs
+#     under-match on Windows rather than over-matching: `libz*` never matches
+#     `zlib1.dll`, `libcrypto*` never matches `libcrypto-3-x64.dll`,
+#     `libstdc++.so*` never matches `libstdc++-6.dll`.  Under-stripping ships a
+#     duplicate of a DLL the host already has, and Windows binds an import to a
+#     module already loaded under that base name BEFORE searching any
+#     directory, so the duplicate is inert.  Over-stripping is fatal and
+#     silent.  The accident therefore falls on the safe side.
+#   * And it is not silent either: `hostBundle` below turns every name this
+#     path drops into a CHECKED claim, so a list that strips the wrong thing
+#     fails the build instead of failing at LoadLibrary.
+#
+# What is PE-specific is the MATCH, not the list.  `is_host_lib` (Unix) is
+# case-sensitive and stays byte-for-byte what it was.  PE import tables spell
+# one DLL two ways inside a single bundle — this toolchain's own tables carry
+# both `KERNEL32.DLL` and `KERNEL32.dll` — so a case-sensitive test here would
+# strip `Qt6Core.dll` off disk and then fail to recognise the import spelled
+# `QT6CORE.DLL` as host-provided, i.e. it would break the bundle it had just
+# stripped.  Both sides are lowercased, exactly as `is_windows_system_dll`
+# already does and for the same reason.
+pe_is_host_lib() {
+  local n="${1,,}" p
+  for p in "${host_patterns[@]+"${host_patterns[@]}"}"; do
+    # The PATTERN is lowercased too, so a caller may write `Qt*.dll` and still
+    # match an import table entry spelled `qt6core.dll`.  Case folding leaves
+    # glob metacharacters alone.
+    # shellcheck disable=SC2254
+    case "$n" in
+      ${p,,}) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# --- hostBundle: is the promise TRUE? --------------------------------------
+# Every hostLibs entry is a claim about ANOTHER repo's output, and on Windows a
+# false claim is silent: the module fails to load with ERROR_MOD_NOT_FOUND
+# (126), and Qt reports only "The specified module could not be found", naming
+# the PLUGIN rather than the DLL that is absent.  That is how a wrong entry
+# hides for a week.
+#
+# `hostBundle` (mkBundle.nix) makes the claim checkable: the caller points at
+# the host's own bundle, and every name this path drops has to be in it.
+#
+# WHICH directory of the host counts is the whole meaning of the check.
+# Windows resolves an import that is not already loaded by searching the
+# LOADING PROCESS's own directory — the host's `bin/` — not the host's lib/,
+# and not the directory the module was installed into.  So the index is the
+# host's application directory only (`bin/` if it has one, else the bundle
+# root), one level deep.  A name found ELSEWHERE in the host tree is reported
+# as exactly that, because "it is in there somewhere" is the shape of the
+# mistake rather than a pass.
+#
+# Optional, deliberately: a module package's host can be a repo the module has
+# no other reason to depend on, and refusing to build without one would make
+# the strip unusable for the consumers it exists for.  When it is absent every
+# claim is still LISTED, once, at the end of Phase 6 — an unverified strip is
+# visible in the log rather than implicit.
+#
+# PE path only.  The Unix arms of `is_host_lib` are untouched by this whole
+# block, so a non-Windows bundle's output tree and log stay byte-identical to
+# what they were before hostBundle existed.
+declare -A pe_host_have      # lowercased base name -> path, host application dir
+declare -A pe_host_tree      # lowercased base name -> path, anywhere in the host
+declare -A pe_host_claims    # name this build trusted the host for -> why
+declare -A pe_host_import_logged
+pe_host_indexed=""
+pe_host_app_dir=""
+pe_host_dropped_total=0
+
+pe_host_index() {
+  [ -n "$pe_host_indexed" ] && return 0
+  pe_host_indexed=1
+  [ -n "${HOST_BUNDLE:-}" ] || return 0
+  if [ ! -d "$HOST_BUNDLE" ]; then
+    echo "  ERROR: hostBundle is '$HOST_BUNDLE', which is not a directory." >&2
+    echo "  It must be the host's assembled bundle — the tree whose application" >&2
+    echo "  directory the host process actually runs from." >&2
+    exit 1
+  fi
+  if [ -d "$HOST_BUNDLE/bin" ]; then
+    pe_host_app_dir="$HOST_BUNDLE/bin"
+  else
+    pe_host_app_dir="$HOST_BUNDLE"
+  fi
+  local f b n_app=0 n_tree=0 files
+  # Captured and guarded, like every other whole-tree walk in this file: a
+  # failed `find` read as an empty index would turn every claim below into an
+  # unconditional ERROR, which is loud, but it would be loud for the wrong
+  # reason and would name the wrong repo.
+  files="$(find -L "$HOST_BUNDLE" -type f)" || {
+    echo "  ERROR: could not walk the host bundle at $HOST_BUNDLE; refusing to" >&2
+    echo "  adjudicate any hostLibs claim on the strength of a failed scan." >&2
+    exit 1
+  }
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    pe_is_pe "$f" || continue
+    b="$(basename "$f")"
+    pe_host_tree["${b,,}"]="$f"
+    n_tree=$((n_tree + 1))
+    case "$f" in
+      "$pe_host_app_dir"/*)
+        # One level deep only — `bin/sub/foo.dll` is not on the loader's search
+        # path for the host process any more than `lib/foo.dll` is.
+        case "${f#"$pe_host_app_dir"/}" in
+          */*) ;;
+          *) pe_host_have["${b,,}"]="$f"; n_app=$((n_app + 1)) ;;
+        esac
+        ;;
+    esac
+  done <<< "$files"
+  echo "  hostBundle: $n_app PE(s) in the host's application directory" \
+       "(${pe_host_app_dir}), $n_tree in its whole tree"
+  # A check that measures nothing passes everything.  An empty application
+  # directory would make every hostLibs claim below fail — which is at least
+  # loud — but an index built from the WRONG tree (a source derivation instead
+  # of its bundle, a store path whose bin/ holds only scripts) is the shape
+  # that produces a confident answer about nothing.
+  if [ "$n_app" -eq 0 ]; then
+    echo "  ERROR: the host bundle at $HOST_BUNDLE has no PE file in its" >&2
+    echo "  application directory ($pe_host_app_dir), so it cannot be the tree" >&2
+    echo "  the host process runs from, and every hostLibs claim checked" >&2
+    echo "  against it would be checked against nothing." >&2
+    exit 1
+  fi
+  return 0
+}
+
+# Record — and, when a hostBundle was given, PROVE — that the host ships $1.
+pe_assert_host_provides() {
+  local name="$1" why="$2" key
+  key="${name,,}"
+  [ -n "${pe_host_claims["$name"]:-}" ] || pe_host_claims["$name"]="$why"
+  [ -n "${HOST_BUNDLE:-}" ] || return 0
+  pe_host_index
+  [ -n "${pe_host_have["$key"]:-}" ] && return 0
+  echo "  ERROR: hostLibs claims the host provides $name ($why)," >&2
+  echo "  but the host bundle's application directory does not contain it:" >&2
+  echo "      $pe_host_app_dir" >&2
+  if [ -n "${pe_host_tree["$key"]:-}" ]; then
+    echo "  It IS in the host bundle, at" >&2
+    echo "      ${pe_host_tree["$key"]}" >&2
+    echo "  but Windows searches the loading process's own directory, not that" >&2
+    echo "  one, so nothing will find it there." >&2
+  fi
+  echo "  A wrong hostLibs entry does not degrade anything: LoadLibrary fails" >&2
+  echo "  with ERROR_MOD_NOT_FOUND (126) and Qt reports only \"The specified" >&2
+  echo "  module could not be found\", naming the plugin and never this DLL." >&2
+  echo "  Either drop the pattern that matches $name from hostLibs, or make the" >&2
+  echo "  host ship it." >&2
+  exit 1
+}
+
+# Remove from the staged tree every PE the host already provides.
+#
+# This is the half that shrinks the package.  Skipping a host-provided name
+# during the sweep stops the bundler PULLING one in; it does nothing about the
+# ones that are already there, and on the shape this exists for they all are:
+# nixpkgs' win-dll-link.sh has already staged the full import closure into the
+# derivation's own lib/, so a Logos module arrives here carrying ~36 MB of Qt,
+# OpenSSL and C++ runtime (Qt6Core.dll alone is 15 MB) that the host ships.
+#
+# Called at the top of every sweep rather than once, because Phase 2b stages
+# whole Qt plugin and QML trees between sweeps and those trees are copied
+# wholesale — a host-provided DLL sitting inside one would otherwise survive
+# into the bundle while the very same name was being skipped at the import
+# level, which is two answers to one question.
+pe_strip_host_libs() {
+  local label="$1"
+  local f b files removed=0 kept=0 examined=0
+  if [ -z "${host_patterns[*]+x}" ]; then
+    echo "  Host-provided strip ($label): no hostLibs declared, so nothing is" \
+         "treated as host-provided and the whole import closure is bundled."
+    return 0
+  fi
+  pe_host_index
+  files="$(find "$out" -type f)" || {
+    echo "  ERROR: could not walk $out to apply hostLibs; refusing to report" >&2
+    echo "  a strip on the strength of a failed scan." >&2
+    exit 1
+  }
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    # Content, not name.  A data file called `Qt6Core.dll` is not a module the
+    # host can provide, and deleting it because a hostLibs glob matched its
+    # name would remove payload while claiming to remove a duplicate.
+    pe_is_pe "$f" || continue
+    examined=$((examined + 1))
+    b="$(basename "$f")"
+    if ! pe_is_host_lib "$b"; then
+      kept=$((kept + 1))
+      continue
+    fi
+    pe_assert_host_provides "$b" "staged in this bundle at ${f#"$out"/}"
+    rm -f "$f" || {
+      echo "  ERROR: could not remove host-provided ${f#"$out"/}" >&2
+      exit 1
+    }
+    # Both memos are keyed by path and both are now stale for it.
+    unset 'pe_filetype_cache[$f]'
+    unset 'pe_arch_cache[$f]'
+    removed=$((removed + 1))
+    echo "    - ${f#"$out"/}  (host-provided)"
+  done <<< "$files"
+  pe_host_dropped_total=$((pe_host_dropped_total + removed))
+  echo "  Host-provided strip ($label): $examined PE(s) examined, $removed" \
+       "removed as host-provided, $kept kept"
+  # The floor.  An over-broad pattern — `*.dll` is the one that has actually
+  # been written — deletes the package's own payload, and every check after
+  # this point would then be measuring an empty bundle.  Phase 1c already
+  # refuses a Windows output with no PE in it; this is the same refusal for the
+  # tree AFTER the strip, which is the only place a strip bug can show up.
+  if [ "$examined" -gt 0 ] && [ "$kept" -eq 0 ]; then
+    echo "  ERROR: the hostLibs strip removed every PE in this bundle" \
+         "($examined examined, $removed removed)." >&2
+    echo "  A pattern is matching this package's own payload, not the host's" >&2
+    echo "  runtime.  Nothing downstream of here would be measuring anything." >&2
+    exit 1
+  fi
+  # Directory maps are memoised behind pe_dir_scanned and files just left the
+  # disk, so anything cached for a directory this touched is now a claim about
+  # a file that is gone.  Dropping both costs one readdir per directory the
+  # sweep goes on to consult, and pe_dir_index rebuilds them from the tree as
+  # it now stands.
+  if [ "$removed" -gt 0 ]; then
+    unset pe_dir_have pe_dir_scanned
+    declare -gA pe_dir_have
+    declare -gA pe_dir_scanned
+  fi
+  return 0
+}
+
 # import name -> space-separated list of importers that wanted it
 declare -A pe_unresolved
 pe_staged_total=0
@@ -929,6 +1174,12 @@ pe_sweep() {
   local label="$1"
   local round=0 added root rootdir imp key src dest roots_seen beside_name
   local dest_name root_arch src_arch app_dir stage_dir
+  # BEFORE the roots are enumerated, not after: what the host provides is not
+  # part of this bundle, so it must not be a root whose own imports get chased
+  # into the closure.  Stripping Qt6Core.dll and then walking it would stage
+  # everything Qt6Core needs — which the host also already has — and the
+  # package would end up larger than if nothing had been stripped at all.
+  pe_strip_host_libs "$label"
   echo "  DLL closure sweep ($label):"
   # WHERE a missing DLL goes.  bin/ is the application's own directory, which
   # Windows searches for every module in the process, so for an app bundle it is
@@ -970,6 +1221,21 @@ pe_sweep() {
       while IFS= read -r imp; do
         [ -n "$imp" ] || continue
         is_windows_system_dll "$imp" && continue
+        # hostLibs, at the IMPORT level.  The strip above removed the copies
+        # that were already here; this is what stops the closure putting them
+        # back, and it has to sit ahead of every directory test below — a
+        # host-provided name is not "missing from bin/", it is not this
+        # bundle's to carry, and treating it as missing is how the sweep would
+        # re-stage exactly what was just removed.
+        if pe_is_host_lib "$imp"; then
+          pe_assert_host_provides "$imp" "imported by ${root#"$out"/}"
+          if [ -z "${pe_host_import_logged["${imp,,}"]:-}" ]; then
+            pe_host_import_logged["${imp,,}"]=1
+            echo "    round $round  = $imp  <- ${root#"$out"/}  (host-provided;" \
+                 "not staged)"
+          fi
+          continue
+        fi
         key="${imp,,}"
         stage_dir="${app_dir:-$rootdir}"
         # bin/ first: that is the executable's own directory, which Windows
@@ -1647,7 +1913,20 @@ if [ "$IS_WINDOWS" = "1" ] && [ -n "$pe_app_dir" ]; then
     fi
     qt_detected=1
     qt_lib_name="$(basename "$f")"
-    if is_host_lib "$qt_lib_name"; then
+    # `pe_is_host_lib`, not `is_host_lib`: this is the PE arm, and the two
+    # predicates read the SAME list with different case rules.  Leaving the
+    # case-sensitive one here would mean a bundle whose Qt6Core.dll was
+    # stripped by `qt*.dll` still answered "Qt is not host-provided" for a
+    # name the same list had just matched — one list, two answers, in the same
+    # phase.
+    #
+    # Belt and braces now rather than the mechanism: the strip at the top of
+    # pass 1 has already removed any Qt DLL this list claims, so on the current
+    # ordering this cannot be reached with a host-claimed name.  It is kept
+    # because `qt_is_host` is read twice more below and a future reordering
+    # that puts detection before the first sweep must not silently change what
+    # those two reads mean.
+    if pe_is_host_lib "$qt_lib_name"; then
       qt_is_host=1
     fi
     break
@@ -3138,10 +3417,23 @@ if [ "$IS_WINDOWS" = "1" ]; then
   # the arithmetic is still meaningful.
   win_src_bin=0
   win_lost_names=0
+  win_host_bin=0
   if [ -d "$DRV_PATH/bin" ]; then
     while IFS= read -r n; do
       win_src_bin=$((win_src_bin + 1))
       [ -e "$out/bin/$n" ] && continue
+      # A hostLibs strip is a DELIBERATE loss, and this check cannot tell the
+      # two apart by looking at the bundle — the file is simply not there
+      # either way.  Without this arm, turning hostLibs on for an app bundle
+      # made Phase 6 report every stripped DLL as a Phase 1 loss and fail the
+      # build: the strip and the verifier disagreeing about the same decision.
+      # The claim is still adjudicated, by pe_assert_host_provides at the point
+      # the file was removed; all that happens here is that it is not counted
+      # twice.
+      if pe_is_host_lib "$n"; then
+        win_host_bin=$((win_host_bin + 1))
+        continue
+      fi
       echo "  ERROR: bin/$n is in the source derivation but not in the bundle" >&2
       win_lost_names=$((win_lost_names + 1))
     done < <(find "$DRV_PATH/bin" -maxdepth 1 -mindepth 1 -printf '%f\n' | sort)
@@ -3155,7 +3447,8 @@ if [ "$IS_WINDOWS" = "1" ]; then
   win_out_bin=0
   [ -d "$out/bin" ] && win_out_bin="$(find "$out/bin" -maxdepth 1 -mindepth 1 | wc -l)"
   echo "  bin/ entries: $win_src_bin in the source derivation, all present by" \
-       "name in the bundle's $win_out_bin ($win_lost_names missing)"
+       "name in the bundle's $win_out_bin ($win_lost_names missing," \
+       "$win_host_bin dropped as host-provided)"
   if [ "$win_lost_names" -gt 0 ]; then
     win_errors=$((win_errors + win_lost_names))
   fi
@@ -3187,6 +3480,7 @@ if [ "$IS_WINDOWS" = "1" ]; then
   win_pe_files=0
   win_import_names=0
   win_arch_checked=0
+  win_host_imports=0
   win_archs=""
   # Only mention bin/ in the unresolved-import error when there IS one; a
   # module-only output has none, and naming a directory that does not exist
@@ -3208,6 +3502,25 @@ if [ "$IS_WINDOWS" = "1" ]; then
       [ -n "$imp" ] || continue
       win_import_names=$((win_import_names + 1))
       is_windows_system_dll "$imp" && continue
+      # A host-claimed name counts as RESOLVED, and it has to be adjudicated
+      # here rather than left to the "in neither its own directory nor bin/ nor
+      # the closure" arm below.  Without this, the strip and the verifier are
+      # two halves of one decision that disagree: the strip removes Qt6Core.dll
+      # on the caller's say-so and Phase 6 then fails the build over the very
+      # DLL it was told not to carry.  That is why the strip cannot land on its
+      # own.
+      #
+      # `pe_assert_host_provides`, not a bare `continue`: this is the last
+      # place the claim is visible, and on a bundle where the strip removed
+      # nothing (the DLL was never staged in the first place — the ordinary
+      # module-with-no-linkDLLsInfolder shape) it is the ONLY place.  A silent
+      # continue here would let an unverifiable claim through on exactly the
+      # shape where nothing else looks at it.
+      if pe_is_host_lib "$imp"; then
+        pe_assert_host_provides "$imp" "imported by ${f#"$out"/}"
+        win_host_imports=$((win_host_imports + 1))
+        continue
+      fi
       key="${imp,,}"
       # Which FILE satisfies it, not merely whether something does: the
       # architecture check below needs the provider, and asking for it is what
@@ -3237,6 +3550,8 @@ if [ "$IS_WINDOWS" = "1" ]; then
     done < <(pe_imports "$f")
   done < <(pe_files)
   echo "  Checked $win_pe_files PE file(s), $win_import_names import name(s)"
+  echo "  Host-provided: $pe_host_dropped_total PE(s) removed from this bundle," \
+       "$win_host_imports import(s) accepted as the host's to satisfy"
   echo "  Machine check: $win_arch_checked resolved import(s) matched their" \
        "importer's architecture; architectures present in this bundle:${win_archs:- none}"
   # ...and now COMPARE it, rather than printing a number nobody reads.
@@ -3287,8 +3602,44 @@ if [ "$IS_WINDOWS" = "1" ]; then
   # only by the presence checks above, and a bundle can still exit 0xC0000135
   # before main() despite everything here being green.
   echo "  PE import tables: every one of the $win_import_names import name(s)" \
-       "across $win_pe_files PE file(s) resolves inside the bundle or to a" \
-       "Windows system DLL."
+       "across $win_pe_files PE file(s) resolves inside the bundle, to a" \
+       "Windows system DLL, or to a name hostLibs assigns to the host."
+  # The hostLibs ledger, printed on the SUCCESS path and never folded into a
+  # count.  Two facts are worth spelling out by name.
+  #
+  # First, WHAT was trusted: these are the names this bundle deliberately does
+  # not carry, and if one of them is wrong the module dies at LoadLibrary with
+  # a message that names the plugin instead.  A number cannot be checked
+  # against the host by a human reading the log; a list can.
+  #
+  # Second, WHETHER it was checked.  With no hostBundle the whole list is a
+  # declaration, and a declaration that prints like a verification is worse
+  # than one that prints like a declaration.
+  if [ -n "${pe_host_claims[*]+x}" ]; then
+    if [ -n "${HOST_BUNDLE:-}" ]; then
+      echo "  Relies on the host for ${#pe_host_claims[@]} DLL(s), each VERIFIED" \
+           "present in $pe_host_app_dir:"
+    else
+      echo "  Relies on the host for ${#pe_host_claims[@]} DLL(s), UNVERIFIED —" \
+           "no hostBundle was given, so these are declarations, not facts:"
+    fi
+    printf '%s\n' "${!pe_host_claims[@]}" | sort | sed 's/^/      /'
+    if [ -z "${HOST_BUNDLE:-}" ]; then
+      echo "      Pass mkBundle's \`hostBundle\` (the host's own bundle) to have" \
+           "each of these checked against the directory the host runs from."
+    fi
+  elif [ -n "${host_patterns[*]+x}" ]; then
+    # hostLibs was set and matched NOTHING — neither a staged file nor an
+    # import.  Not an error: one list is shared across many packages and most
+    # patterns legitimately miss on any given one.  But it is also exactly what
+    # a wrong-namespace list looks like (Unix globs on a PE bundle: `libz*`
+    # against `zlib1.dll`), and that has to be visible rather than read as "the
+    # strip ran".
+    echo "  hostLibs was declared but matched nothing in this bundle: no file" \
+         "was dropped and no import was assigned to the host.  If that is a" \
+         "surprise, check the spelling — a PE bundle needs Windows file names" \
+         "(\`zlib1.dll\`), and a Unix pattern like \`libz*\` cannot match one."
+  fi
   echo "  NOT checked (uncheckable statically): DLLs loaded by a name computed" \
        "at runtime.  Those are covered only by the directory presence checks" \
        "above."

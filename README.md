@@ -50,6 +50,39 @@ in bundle
 
 See [mkBundle.nix](mkBundle.nix) for the full interface.
 
+### Libraries the host already ships (`hostLibs`, `hostBundle`)
+
+A bundle that is loaded *into* another program — a plugin, a module installed
+next to a host application — should not carry a second copy of the runtime that
+host already provides. `hostLibs` is that list, and it applies on every target,
+Windows/PE included:
+
+```nix
+mkBundle {
+  drv = myModule;
+  # Written in the TARGET's own spelling. There is one list, not one per
+  # platform, and the two spellings do not transfer: `libz*` never matches
+  # `zlib1.dll`, `libcrypto*` never matches `libcrypto-3-x64.dll`.
+  hostLibs = [ "Qt*.dll" "libstdc++-*.dll" "libgcc_s_*.dll" "zlib1.dll" ];
+
+  # Optional, PE only: the host's own bundle. Every name the bundler drops (or
+  # accepts as the host's to satisfy) must be in that tree's application
+  # directory — `bin/` if it has one, else the root — because that is the
+  # directory Windows searches for the loading process.
+  hostBundle = myHostApp;
+}
+```
+
+Both bundle shapes are supported: an application (`bin/`) and a module whose
+whole output is `lib/<name>.dll`.
+
+Every `hostLibs` entry is a promise about another package's output, and on
+Windows a broken promise is silent — `LoadLibrary` fails with
+`ERROR_MOD_NOT_FOUND` (126) and Qt reports only "The specified module could not
+be found", naming the *plugin* rather than the DLL that is absent. `hostBundle`
+turns that promise into a build-time check; without it the build still works and
+the log lists every claim, marked `UNVERIFIED`.
+
 ## Caveats
 
 - **Graphics/OpenGL on Linux.** GPU driver libraries (`libGL`, `libEGL`, `libvulkan`, etc.) are excluded by default because they must match the host's hardware drivers. This is the same [well-known problem](https://github.com/NixOS/nixpkgs/issues/9415) that affects AppImages and other bundling approaches. You may need [nixGL](https://github.com/nix-community/nixGL) or similar.
