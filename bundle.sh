@@ -3857,6 +3857,28 @@ if [ "$IS_WINDOWS" = "1" ]; then
       echo "      Pass mkBundle's \`hostBundle\` (the host's own bundle) to have" \
            "each of these checked against the directory the host runs from."
     fi
+    # The other half of the promise, and the half no build-time check can
+    # reach.  Measured on real Windows 11 (x86-64), one stripped module and one
+    # unstripped control, four LoadLibraryEx search modes:
+    #
+    #   flags 0x0000 (default)                  stripped LOADS
+    #   flags 0x0008 LOAD_WITH_ALTERED_SEARCH_PATH   stripped FAILS 126
+    #   flags 0x0100 SEARCH_DLL_LOAD_DIR alone       stripped FAILS 126
+    #   flags 0x1100 DLL_LOAD_DIR|DEFAULT_DIRS       stripped LOADS
+    #
+    # In every failing row the unstripped control loaded from the same
+    # directory, so the failure is the strip and not the machine.  A
+    # host-provided DLL is found because the host process's OWN directory is
+    # searched, and two of the four modes remove exactly that directory from
+    # the search.  logos-module passes 0x1100 on purpose
+    # (src/win_dll_search.h); a host that does not is a host these bundles
+    # cannot be installed under, and nothing at build time can tell.
+    echo "      These resolve from the HOST PROCESS's own directory, so the" \
+         "host must load this module with a search mode that still includes" \
+         "it — LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR|LOAD_LIBRARY_SEARCH_DEFAULT_DIRS," \
+         "or the default order.  LOAD_WITH_ALTERED_SEARCH_PATH, and" \
+         "LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR on its own, both REPLACE that" \
+         "directory and make a stripped module fail with ERROR_MOD_NOT_FOUND."
   elif [ -n "${host_patterns[*]+x}" ]; then
     # hostLibs was set and matched NOTHING — neither a staged file nor an
     # import.  Not an error: one list is shared across many packages and most

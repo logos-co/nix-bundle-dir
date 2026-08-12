@@ -92,6 +92,26 @@ Do not read anything into the shape of the patterns. Cross-platform spellings
 comes from the payload rule, from `hostBundle`, and from the build failing when
 a strip would empty the bundle.
 
+**The host must also LOOK there.** A stripped module finds the host's DLLs
+because Windows searches the *loading process's own directory*, and some
+`LoadLibraryEx` flags remove precisely that directory from the search. Measured
+on Windows 11 x86-64 with one stripped module and one unstripped control:
+
+| flags | what it means | stripped module | control |
+|---|---|---|---|
+| `0x0000` | default search order | **loads** | loads |
+| `0x0008` | `LOAD_WITH_ALTERED_SEARCH_PATH` | fails, 126 | loads |
+| `0x0100` | `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` alone | fails, 126 | loads |
+| `0x1100` | `…DLL_LOAD_DIR｜…DEFAULT_DIRS` | **loads** | loads |
+
+`0x1100` is what logos-module's `preloadPluginWithOwnDirSearch`
+(`src/win_dll_search.h`) passes, which is why Logos modules may be stripped.
+The two failing modes substitute the module's own directory *for* the
+application directory instead of adding to it. Nothing at build time can see
+which mode a host will use, so this is a property of the host you must check
+once, by hand — `hostBundle` checks that the DLL is *there*, not that anyone
+will look.
+
 Every `hostLibs` entry is a promise about another package's output, and on
 Windows a broken promise is silent — `LoadLibrary` fails with
 `ERROR_MOD_NOT_FOUND` (126) and Qt reports only "The specified module could not

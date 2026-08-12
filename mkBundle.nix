@@ -60,6 +60,21 @@
 # ignored: there is no claim for it to check, so it could only report success
 # about nothing.
 #
+# What it CANNOT check is the other half of the promise: that the host will
+# look in its own directory when it loads this module. Measured on Windows 11
+# x86-64, a stripped module against a host that does ship the DLLs:
+#
+#   LoadLibraryEx flags 0x0000 (default order)          LOADS
+#   LoadLibraryEx flags 0x0008 ALTERED_SEARCH_PATH      fails, 126
+#   LoadLibraryEx flags 0x0100 SEARCH_DLL_LOAD_DIR      fails, 126
+#   LoadLibraryEx flags 0x1100 DLL_LOAD_DIR|DEFAULT_DIRS LOADS
+#
+# with an unstripped control loading in every row, so the failures are the
+# strip and not the machine. The middle two REPLACE the application directory
+# with the module's own instead of adding to it. logos-module passes 0x1100
+# (src/win_dll_search.h). A host that passes one of the other two cannot host a
+# stripped bundle, and no build-time check can see which one it will use.
+#
 # Not consulted on ELF/Mach-O, and refused there rather than silently dropped —
 # see the `throwIf` below. Those paths are unchanged by this argument, down to
 # the byte, and extending the check to them is a separate change with its own
