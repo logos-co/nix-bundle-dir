@@ -27,6 +27,9 @@
         let peHostLibs = import ./tests/pe-hostlibs.nix {
               inherit pkgs;
               mkBundle = import ./mkBundle.nix { inherit pkgs; };
+              # One subject is about what `qtPlugin` INJECTS, so it has to run
+              # the real bundler and not a reconstruction of it.
+              qtPluginBundler = self.bundlers.${system}.qtPlugin;
             };
         in {
           extra-dirs-nested =
@@ -46,14 +49,15 @@
           pe-hostlibs-module          = peHostLibs.moduleStripped;
           pe-hostlibs-module-verified = peHostLibs.moduleStrippedVerified;
           pe-hostlibs-claimed-only    = peHostLibs.moduleClaimedOnly;
-          pe-hostlibs-app             = peHostLibs.appStripped;
           pe-hostlibs-mixed-case      = peHostLibs.moduleStrippedMixedCase;
-          # The payload rule: what the strip may NOT remove.
-          pe-hostlibs-payload-wildcard = peHostLibs.payloadSurvivesWildcard;
-          pe-hostlibs-payload-copies   = peHostLibs.payloadCopiesKept;
-          pe-hostlibs-payload-extradirs = peHostLibs.extraDirsPayloadKept;
-          pe-hostlibs-payload-qt        = peHostLibs.qtPayloadKept;
-          pe-hostlibs-payload-qt-unverified = peHostLibs.qtPayloadKeptUnverified;
+          pe-hostlibs-copies          = peHostLibs.copiesStrippedToo;
+          pe-hostlibs-bin-stripped    = peHostLibs.moduleBinStripped;
+          # The declaration rule: what the strip may NOT remove, and who may
+          # ask for a removal at all.
+          pe-hostlibs-extradirs       = peHostLibs.extraDirsKept;
+          pe-hostlibs-qtplugin-inject = peHostLibs.qtPluginBundlerKeepsPayload;
+          pe-hostlibs-caller-qt       = peHostLibs.callerQtStripsOwnQt;
+          pe-hostlibs-qt-dir          = peHostLibs.qtDirHostProvided;
         });
 
       # Subjects that MUST fail to build. Kept out of `checks` on purpose:
@@ -66,6 +70,7 @@
         let peHostLibs = import ./tests/pe-hostlibs.nix {
               inherit pkgs;
               mkBundle = import ./mkBundle.nix { inherit pkgs; };
+              qtPluginBundler = self.bundlers.${system}.qtPlugin;
             };
         in {
           extra-dirs-dirty =
@@ -80,8 +85,11 @@
           pe-hostlibs-host-no-libs     = peHostLibs.hostBundleWithoutHostLibs;
           pe-hostlibs-host-no-libs-garbage = peHostLibs.hostBundleGarbageIgnored;
           pe-hostlibs-host-on-unix     = peHostLibs.hostBundleOnUnix;
-          pe-hostlibs-strip-everything = peHostLibs.stripEverythingLinked;
-          pe-hostlibs-qt-not-host      = peHostLibs.qtPayloadNotHostProvided;
+          pe-hostlibs-host-unknown     = peHostLibs.hostBundleOnUnknownTarget;
+          pe-hostlibs-host-not-dir     = peHostLibs.hostBundleNotADirectory;
+          pe-hostlibs-strip-everything = peHostLibs.stripEverything;
+          pe-hostlibs-qt-dir-not-host  = peHostLibs.qtDirNotHostProvided;
+          pe-hostlibs-app-refused      = peHostLibs.appShapeRefused;
           pe-hostlibs-unclaimed        = peHostLibs.moduleUnclaimed;
         });
 
@@ -133,15 +141,32 @@
           # A Qt plugin is loaded INTO a Qt host, so the Qt runtime is the
           # host's, and this bundler says so on the caller's behalf.
           #
-          # Note what that appended `Qt*` is: a pattern the BUNDLER writes,
-          # which the caller never sees and cannot review. On the PE path the
-          # match folds case on both sides, so it reads `qt*` and matches the
-          # plugin's own `qtquick2plugin.dll` as readily as `Qt6Core.dll` —
-          # measured on the real Windows Qt bundle, before the payload rule
-          # existed, as 816 PE files in and 796 out with exit 0. It is only
-          # sound to inject a pattern here because `pe_strip_host_libs` can no
-          # longer remove anything the bundled derivation's own build produced.
-          # Do not widen this without re-reading that rule.
+          # THE INJECTION IS GATED TO NON-WINDOWS TARGETS, and that gate is the
+          # whole point of this comment. `Qt*` here is a pattern the BUNDLER
+          # writes: the caller never sees it and cannot review it. What that
+          # pattern MEANS is not the same on both platforms —
+          #
+          #   * on ELF/Mach-O `hostLibs` filters what `trace_deps` ADDS. The
+          #     worst an injected pattern can do is decline to copy something
+          #     in, which is exactly what this bundler is for.
+          #   * on PE it DELETES, because win-dll-link.sh has already staged the
+          #     import closure into the derivation's own output. The PE match
+          #     also folds case on both sides, so `Qt*` reads as `qt*` and
+          #     matches the plugin's own `qtquick2plugin.dll` as readily as
+          #     `Qt6Core.dll`. Measured on the real Windows Qt bundle while this
+          #     injection still reached the PE path: 816 PE files in, 796 out,
+          #     exit 0 — the bundler silently deleting what it was asked to
+          #     package.
+          #
+          # So the rule is: a bundler-injected pattern must never be able to
+          # delete. A caller who wants a Qt plugin's Qt runtime stripped on
+          # Windows writes `hostLibs = [ "Qt*.dll" ]` themselves, and gets
+          # exactly that, with `hostBundle` to check it.
+          #
+          # `or false` is right for a drv with no stdenv: bundle.sh resolves an
+          # unknown target to Unix (Phase 1c), so those bundles take the path
+          # where the injection is meaningful and harmless — and this expression
+          # answers the same question bundle.sh will.
           qtPlugin = drv:
             mkBundle {
               inherit drv;
@@ -149,7 +174,9 @@
               extraDirs = drv.extraDirs or [];
               extraClosurePaths = drv.extraClosurePaths or [];
               hostBundle = drv.hostBundle or null;
-              hostLibs = (drv.hostLibs or []) ++ [ "Qt*" ];
+              hostLibs = (drv.hostLibs or [])
+                ++ nixpkgs.lib.optional
+                     (!(drv.stdenv.hostPlatform.isWindows or false)) "Qt*";
               warnOnBinaryData = true;
             };
         });

@@ -26,15 +26,29 @@
 # spellings do under-match (`libz*` cannot match `zlib1.dll`), but nothing in
 # this design may rest on that.
 #
-# What keeps a wrong list from being destructive is not the shape of the glob:
+# WHAT THE PE PATH MAY DELETE. On ELF and Mach-O this list only filters what
+# `trace_deps` copies IN; on Windows the import closure is already inside the
+# derivation's output (nixpkgs' win-dll-link.sh stages it during fixup), so the
+# bundler has to delete, and deleting is the more dangerous operation. It is
+# bounded by WHO DECLARED WHAT, and infers nothing about a file:
 #
-#   * on the PE path the strip may only remove a file that came along WITH the
-#     package — one the bundler staged, or one win-dll-link.sh linked in from
-#     another store path — and never a file the derivation's own build
-#     produced (the payload rule; see `pe_strip_host_libs` in bundle.sh);
-#   * `hostBundle` below turns every remaining claim into a checked fact;
-#   * and bundle.sh says so in the log when a declared list matches nothing at
-#     all, which is what a wrong-namespace list looks like.
+#   * a pattern the CALLER wrote deletes. `hostLibs = [ "Qt*" ]` on a Qt plugin
+#     package removes that package's own Qt6*.dll, and that is the contract;
+#   * a pattern a BUNDLER injects on the caller's behalf never reaches the PE
+#     path at all — see `bundlers.<sys>.qtPlugin` in flake.nix, which appends
+#     `Qt*` only on a non-Windows target;
+#   * `extraDirs` is never touched. Those directories are named by the caller,
+#     one by one, as "carry this";
+#   * and what does go is checked (`hostBundle`) or listed by name in the log
+#     as UNVERIFIED, so an over-broad list is loud rather than silent.
+#
+# An earlier revision bounded the strip by PROVENANCE instead — a regular file
+# in the derivation's output is its own build product, a symlink is a dependency
+# travelling with it — which is recorded because it reads well and does not
+# work: in the real `logos-package_manager-module` Windows lib/, 8 of 19 DLLs
+# (icudt76, icuuc76, libstdc++-6, libgcc_s_seh-1, libmcfgthread-2, libsodium-26
+# and more) are REGULAR FILES, so on the shape this feature exists for it kept
+# everything and stripped nothing.
 #
 # See the long note above `pe_is_host_lib` in bundle.sh for why the LIST is
 # shared and only the MATCH is platform-specific.
@@ -62,18 +76,39 @@
 #
 # What it CANNOT check is the other half of the promise: that the host will
 # look in its own directory when it loads this module. Measured on Windows 11
-# x86-64, a stripped module against a host that does ship the DLLs:
+# x86-64 against the REAL logos-package_manager module (16 DLLs stripped, 3
+# kept) and a host bundle shipping those 16, with the UNSTRIPPED bundle of the
+# same module as the control and the process's CURRENT DIRECTORY holding none
+# of them:
 #
-#   LoadLibraryEx flags 0x0000 (default order)          LOADS
-#   LoadLibraryEx flags 0x0008 ALTERED_SEARCH_PATH      fails, 126
-#   LoadLibraryEx flags 0x0100 SEARCH_DLL_LOAD_DIR      fails, 126
-#   LoadLibraryEx flags 0x1100 DLL_LOAD_DIR|DEFAULT_DIRS LOADS
+#                                          stripped   control
+#   flags 0x1100 DLL_LOAD_DIR|DEFAULT_DIRS  LOADS      LOADS
+#   flags 0x0008 ALTERED_SEARCH_PATH        126        LOADS   <- the strip
+#   flags 0x0008, CWD = the host's bin\     LOADS      -
+#   flags 0x0000 (default order)            126        126     <- not the strip
+#   flags 0x0100 SEARCH_DLL_LOAD_DIR alone  126        126     <- not the strip
+#   flags 0x1000 SEARCH_DEFAULT_DIRS alone  126        126     <- not the strip
+#   flags 0x1100, host missing one claim    126        LOADS   <- the claim
 #
-# with an unstripped control loading in every row, so the failures are the
-# strip and not the machine. The middle two REPLACE the application directory
-# with the module's own instead of adding to it. logos-module passes 0x1100
-# (src/win_dll_search.h). A host that passes one of the other two cannot host a
-# stripped bundle, and no build-time check can see which one it will use.
+# logos-module passes 0x1100 (src/win_dll_search.h), which is the row that
+# matters. Only two rows are attributable to the strip at all — the ones where
+# the control differs — and reading the others as flag verdicts is how the
+# previous version of this table got 0x0000 wrong: it was measured on a
+# synthetic module with no private dependencies, and a real module keeps its own
+# DLLs beside it, which the default order never searches.
+#
+# The CWD qualifier is load-bearing too: 0x0008 substitutes the module's
+# directory for the application's and leaves the rest of the standard order —
+# CURRENT DIRECTORY included — in place, so the same host launched from its own
+# bin\ loads the same stripped module through 0x0008.
+#
+# And it only applies to a MODULE. A bundle with an executable of its own is
+# refused by bundle.sh the moment hostLibs would drop anything, because for that
+# shape the loading process is the bundle's own .exe and the directory Windows
+# searches is the bundle's own bin\ — the host's DLLs are not there, and this
+# argument would be verifying a directory the loader never consults. Measured:
+# such a bundle run from its own bin\ dies 0xC0000135 with no output, and runs
+# only with the host's bin\ on PATH.
 #
 # Not consulted on ELF/Mach-O, and refused there rather than silently dropped —
 # see the `throwIf` below. Those paths are unchanged by this argument, down to

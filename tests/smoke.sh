@@ -93,7 +93,7 @@ echo
 #
 # This block exists because the contract in tests/pe-hostlibs.nix was reachable
 # only through `nix flake check`, and CI does not run `nix flake check` — it
-# runs this file. Ten subjects that must build and eight that must be refused
+# runs this file. Ten subjects that must build and eleven that must be refused
 # were therefore built by nobody, which is the same as not having them.
 #
 # x86_64-linux only, and by SYSTEM rather than by `uname`: every subject is a
@@ -106,9 +106,9 @@ if [ "$SYS" = "x86_64-linux" ]; then
   # Must BUILD. Each asserts the resulting PE SET, not a count: the defect
   # class here is a bundle that is missing a file and exits 0.
   for c in pe-hostlibs-module pe-hostlibs-module-verified pe-hostlibs-claimed-only \
-           pe-hostlibs-app pe-hostlibs-mixed-case pe-hostlibs-payload-wildcard \
-           pe-hostlibs-payload-copies pe-hostlibs-payload-extradirs \
-           pe-hostlibs-payload-qt pe-hostlibs-payload-qt-unverified; do
+           pe-hostlibs-mixed-case pe-hostlibs-copies pe-hostlibs-bin-stripped \
+           pe-hostlibs-extradirs pe-hostlibs-qtplugin-inject \
+           pe-hostlibs-caller-qt pe-hostlibs-qt-dir; do
     if nix build -L "$FLAKE#checks.$SYS.$c" --no-link > "pe-$c.log" 2>&1; then
       ok "$c"
     else
@@ -120,7 +120,10 @@ if [ "$SYS" = "x86_64-linux" ]; then
   # A subject that fails for the wrong reason is the failure this whole file is
   # written against, and exit status alone cannot tell the two apart.
   #
-  # Pairs of "attribute<TAB>expected fragment".
+  # Pairs of "attribute|expected fragment", split on the `|` this loop's IFS
+  # actually sets. (It said TAB, over a reader that has never been able to see
+  # one — the fifth comment on this branch found describing something that is
+  # not there.)
   while IFS='|' read -r c want; do
     [ -n "$c" ] || continue
     if nix build -L "$FLAKE#tests.$SYS.$c" --no-link > "pe-$c.log" 2>&1; then
@@ -137,8 +140,11 @@ pe-hostlibs-host-vacuous|has no PE file in its
 pe-hostlibs-host-no-libs|ERROR: hostBundle was given but hostLibs is empty
 pe-hostlibs-host-no-libs-garbage|has no PE file in its
 pe-hostlibs-host-on-unix|whose target Nix reports as
+pe-hostlibs-host-unknown|ERROR: hostBundle was given, but this bundle's target is not Windows
+pe-hostlibs-host-not-dir|which is not a directory
 pe-hostlibs-strip-everything|ERROR: the hostLibs strip removed every PE in this bundle
-pe-hostlibs-qt-not-host|no Qt plugin directory for this
+pe-hostlibs-qt-dir-not-host|no Qt plugin directory for this
+pe-hostlibs-app-refused|but this bundle contains an executable of its own
 pe-hostlibs-unclaimed|DLL import(s) could not be resolved
 PE_FAILS
 else

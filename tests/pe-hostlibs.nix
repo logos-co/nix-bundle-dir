@@ -13,24 +13,28 @@
 #   3. the ACCEPTANCE, in Phase 6, without which the verifier fails the build
 #      over the very DLLs the strip was told not to carry.
 #
-# And one rule that BOUNDS the strip, because deleting is not the same
+# And the rule that BOUNDS the strip, because deleting is not the same
 # operation as declining to add. On ELF and Mach-O `hostLibs` only ever filters
 # what `trace_deps` copies IN; on Windows the import closure has already been
 # staged into the derivation's own output by nixpkgs' win-dll-link.sh before
-# the bundler runs, so the PE path has to delete. The rule is:
+# the bundler runs, so the PE path has to delete. The rule is about
+# DECLARATION, and infers nothing about any file:
 #
-#   the strip may only remove a file that came along WITH the package — one
-#   the bundler staged, or one win-dll-link.sh linked in from another store
-#   path — never a file the derivation's own build produced.
+#   * a pattern the CALLER wrote deletes — including one that matches the
+#     package's own build products;
+#   * a pattern a BUNDLER injects never reaches the PE path (flake.nix's
+#     `qtPlugin` appends `Qt*` only on a non-Windows target);
+#   * a directory named in `extraDirs` is never touched.
 #
-# That rule is why the fixtures below distinguish LINKED runtime DLLs (the real
-# win-dll-link shape, `ln -sr` into another store path) from COPIED ones. Both
-# shapes exist in the wild and the bundler must treat them differently: the
-# first is a dependency travelling with the package, the second is the
-# package's own output. Two measured defects — `bundlers.qtPlugin` deleting
-# `qtquick2plugin.dll` because it appends `Qt*` to hostLibs itself, and the
-# strip emptying an `extraDirs` entry — close on that one rule, and neither
-# closes on a rule about pattern syntax.
+# The fixtures below therefore no longer distinguish LINKED from COPIED DLLs as
+# a matter of policy — `moduleLinked` and `moduleCopied` are stripped alike, and
+# a subject asserts exactly that. An earlier revision bounded the strip by that
+# distinction (regular file = the build produced it, symlink = a dependency
+# travelling with it) and it fails on the shape that matters: in the real
+# `logos-package_manager-module` x86_64-w64-mingw32 output, 8 of the 19 DLLs in
+# lib/ — icudt76, icuuc76, libstdc++-6, libgcc_s_seh-1, libmcfgthread-2,
+# libsodium-26, zlib1 and more — are REGULAR FILES, so the rule called the whole
+# host runtime payload and stripped nothing.
 #
 # The fourth part is `hostBundle`, which makes the list checkable rather than
 # declared. Every hostLibs entry is a promise about another repo's output, and
@@ -46,10 +50,13 @@
 #
 # x86_64-linux only, by the caller's gate in flake.nix: every subject is a
 # `pkgsCross.mingwW64` build, and the mingw toolchain is substitutable there.
-{ pkgs, mkBundle }:
+#
+# `qtPluginBundler` is flake.nix's own `bundlers.<sys>.qtPlugin`, passed in
+# because one subject is about what THAT function injects, which cannot be
+# reproduced by calling mkBundle directly.
+{ pkgs, mkBundle, qtPluginBundler }:
 
 let
-  inherit (pkgs) lib;
   mingw = pkgs.pkgsCross.mingwW64;
 
   # The C++ runtime DLLs a mingw C++ module imports. Chosen because they are
@@ -86,10 +93,7 @@ let
   # `dontFixup`, so each fixture is exactly what this file says it is: the
   # mingw stdenv's own win-dll-link hook would otherwise stage DLLs on its own
   # schedule and the subjects would be asserting about its output rather than
-  # about the bundler's. The hook's SHAPE is reproduced by hand where it
-  # matters — `ln -s` into another store path, which is what `ln -sr` produces
-  # once Nix has resolved it — because that shape is exactly what the payload
-  # rule reads.
+  # about the bundler's.
 
   # SHAPE 1: a module. `lib/<name>_plugin.dll` and NOTHING else -- no bin/.
   # This is the shape nix-bundle-lgx feeds through the bundler, and the one
@@ -118,10 +122,10 @@ let
     '';
   };
 
-  # SHAPE 1c: the same names, but COPIED into the derivation's own output
-  # rather than linked. Byte-for-byte the same DLLs; the difference is that
-  # this derivation produced them, so they are its payload and the strip may
-  # not touch them however the patterns read.
+  # SHAPE 1c: the same names, COPIED into the derivation's own output rather
+  # than linked -- which is what the real module output looks like for most of
+  # its runtime DLLs. Byte-for-byte the same DLLs; under the declaration rule
+  # the bundler treats them identically, and `copiesStrippedToo` asserts it.
   moduleCopied = mingw.stdenv.mkDerivation {
     name = "hostlibs-module-copied";
     dontUnpack = true;
@@ -137,9 +141,7 @@ let
   # SHAPE 1d: a module carrying a DLL in a directory the caller asked for by
   # name. `extraDirs` is an explicit "carry this", and the strip walked the
   # whole of $out with no exception for it -- measured: the entry shipped
-  # EMPTY, rc=0. Not fixable by exempting extraDirs wholesale either, since the
-  # sweep legitimately stages a dependency into an extraDir when the importer
-  # lives there; only provenance separates the two.
+  # EMPTY, rc=0.
   moduleWithAssets = mingw.stdenv.mkDerivation {
     name = "hostlibs-module-assets";
     dontUnpack = true;
@@ -154,26 +156,60 @@ let
     '';
   };
 
-  # SHAPE 1e: a derivation with NO output of its own -- every file in it is a
-  # link to another store path. By the payload rule it has no payload, so
-  # `hostLibs` governs its whole tree and an over-broad list can still empty
-  # it. That is the one shape the floor in pe_strip_host_libs still guards, and
-  # this is what makes the floor demonstrable rather than asserted.
-  moduleAllLinked = mingw.stdenv.mkDerivation {
-    name = "hostlibs-module-all-linked";
+  # SHAPE 1e: a library package's bin/ -- DLLs and no executable, which is what
+  # `linkDLLsInfolder "$out/bin"` leaves behind. Nothing in it can be a process,
+  # so the app-shape refusal does not apply, and it is the shape that reaches
+  # Phase 6's "this bin/ entry is missing because THIS build removed it" arm.
+  moduleBinDlls = mingw.stdenv.mkDerivation {
+    name = "hostlibs-module-bin-dlls";
     dontUnpack = true;
-    dontBuild = true;
     dontFixup = true;
+    buildPhase = "$CXX -shared -o demo_plugin.dll ${pluginSrc}";
     installPhase = ''
-      mkdir -p $out/lib
+      mkdir -p $out/lib $out/bin && cp demo_plugin.dll $out/lib/
+      ln -s ${dllDir}/libstdc++-6.dll ${dllDir}/libgcc_s_seh-1.dll ${mcfgDll} $out/bin/
+    '';
+  };
+
+  # SHAPE 1f: a module whose OWN BUILD produces a PE named like a Qt library --
+  # the shape of every Qt plugin package. Used twice, for the two halves of the
+  # declaration rule: a CALLER's `Qt*.dll` removes this Qt6Core.dll, and the
+  # `qtPlugin` bundler's injected `Qt*` does not.
+  qtNamedModule = mingw.stdenv.mkDerivation {
+    name = "hostlibs-qt-named-module";
+    dontUnpack = true;
+    dontFixup = true;
+    buildPhase = ''
+      $CXX -shared -o demo_plugin.dll ${pluginSrc}
+      $CXX -shared -o Qt6Core.dll ${pluginSrc}
+    '';
+    installPhase = ''
+      mkdir -p $out/lib && cp demo_plugin.dll Qt6Core.dll $out/lib/
       ln -s ${dllDir}/libstdc++-6.dll ${dllDir}/libgcc_s_seh-1.dll ${mcfgDll} $out/lib/
     '';
   };
 
-  # SHAPE 2: an application. Has a bin/, which is a different code path in
-  # three places -- the sweep stages into it, Phase 1c counts it, and Phase 6
-  # asserts every source bin/ entry survived. That last one FAILS the build on
-  # a stripped app unless it is taught the same rule as the strip.
+  # SHAPE 1g: a bin/ holding a DIRECTORY named like a Qt DLL. Contrived-looking
+  # and not invented: it is the one shape that still reaches the
+  # `pe_is_host_lib "$qt_lib_name"` arm in Qt detection, because the strip walks
+  # `-type f` and cannot remove a directory while the detection loop's `[ -e ]`
+  # counts one. bundle.sh has carried three different wrong claims about that
+  # arm's reachability; this is what makes the current one checkable.
+  qtDirModule = mingw.stdenv.mkDerivation {
+    name = "hostlibs-qt-dir-module";
+    dontUnpack = true;
+    dontFixup = true;
+    buildPhase = "$CXX -shared -o demo_plugin.dll ${pluginSrc}";
+    installPhase = ''
+      mkdir -p $out/lib $out/bin/Qt6Core.dll
+      cp demo_plugin.dll $out/lib/
+      ln -s ${dllDir}/libstdc++-6.dll ${dllDir}/libgcc_s_seh-1.dll ${mcfgDll} $out/lib/
+    '';
+  };
+
+  # SHAPE 2: an application. It has an executable of its own, so it can BE the
+  # process -- and then the directory Windows searches is this bundle's bin/,
+  # not the host's. Every hostLibs claim on this shape is refused.
   appLinked = mingw.stdenv.mkDerivation {
     name = "hostlibs-app-linked";
     dontUnpack = true;
@@ -194,31 +230,21 @@ let
     installPhase = "mkdir -p $out/bin && cp demo_app.exe $out/bin/";
   };
 
-  # SHAPE 3: an application whose OWN BUILD produces a PE named like a Qt
-  # library. Contrived-looking and not contrived: it is the shape of every Qt
-  # module package, and it is the only way to reach the `pe_is_host_lib
-  # "$qt_lib_name"` arm in the Qt-detection block with a host-claimed name --
-  # which an earlier comment in bundle.sh asserted was unreachable.
-  qtNamedApp = mingw.stdenv.mkDerivation {
-    name = "hostlibs-qt-named-app";
-    dontUnpack = true;
-    dontFixup = true;
-    buildPhase = ''
-      $CXX -o demo_app.exe ${appSrc}
-      $CXX -shared -o Qt6Core.dll ${pluginSrc}
-    '';
-    installPhase = ''
-      mkdir -p $out/bin && cp demo_app.exe Qt6Core.dll $out/bin/
-      ln -s ${dllDir}/libstdc++-6.dll ${dllDir}/libgcc_s_seh-1.dll ${mcfgDll} $out/bin/
-    '';
-  };
-
   # The host's own bundle: the tree whose application directory the host
   # process runs from. `bin/`, because that is the directory Windows searches
   # for the loading process.
   hostGood = pkgs.runCommand "hostlibs-host-good" { } ''
     mkdir -p $out/bin
     cp ${dllDir}/libstdc++-6.dll ${dllDir}/libgcc_s_seh-1.dll ${mcfgDll} $out/bin/
+    cp ${appPlain}/bin/demo_app.exe $out/bin/host.exe
+  '';
+
+  # The same host, plus a Qt6Core.dll -- for the subject where the CALLER
+  # declares `Qt*.dll` and the bundle's own Qt-named DLL is therefore dropped.
+  hostWithQt = pkgs.runCommand "hostlibs-host-qt" { } ''
+    mkdir -p $out/bin
+    cp ${dllDir}/libstdc++-6.dll ${dllDir}/libgcc_s_seh-1.dll ${mcfgDll} $out/bin/
+    cp ${qtNamedModule}/lib/Qt6Core.dll $out/bin/
     cp ${appPlain}/bin/demo_app.exe $out/bin/host.exe
   '';
 
@@ -245,6 +271,8 @@ let
 
   # `find | sort` of the bundle's PE files, relative -- the whole assertion is
   # about WHICH files are there, so compare the set rather than a count.
+  # Deliberately not `-type f`: a DIRECTORY named like a DLL is part of what
+  # some subjects are asserting about.
   peSet = b: "cd ${b} && find . -name '*.dll' -o -name '*.exe' | LC_ALL=C sort | tr '\\n' ' '";
 
   expect = name: bundle: want: pkgs.runCommand "check-${name}" { } ''
@@ -292,17 +320,6 @@ in
     })
     "./lib/demo_plugin.dll ";
 
-  # The app shape. bin/ loses two DLLs, which Phase 6's "every source bin/
-  # entry is still here" check has to accept as deliberate -- and it accepts
-  # them by PATH, from the set this build actually removed, not by re-testing
-  # the name against hostLibs.
-  appStripped = expect "app-stripped"
-    (bundleOf {
-      drv = appLinked; name = "hostlibs-app-stripped";
-      hostLibs = hostDlls; hostBundle = hostGood;
-    })
-    "./bin/demo_app.exe ";
-
   # A PE import table spells one DLL two ways inside a single bundle
   # (KERNEL32.DLL and KERNEL32.dll both occur in this toolchain's own output),
   # so the PE match folds case on BOTH sides -- pattern included. A caller
@@ -315,35 +332,36 @@ in
     })
     "./lib/demo_plugin.dll ";
 
-  # ---- the payload rule ---------------------------------------------------
-
-  # THE `*.dll` SUBJECT. Before the payload rule this pattern removed every PE
-  # in the bundle and the build died on the floor; the real defect it stands
-  # for is the same pattern removing SOME payload and exiting 0. Now the
-  # patterns cannot reach the derivation's own output at all, so the widest
-  # possible list still ships the package.
-  payloadSurvivesWildcard = expect "payload-survives-wildcard"
+  # COPIED, not linked. Identical outcome to `moduleStripped`, and that is the
+  # assertion: how a file got into the derivation's output is not something this
+  # bundler reasons about. The provenance rule this replaces kept all three of
+  # these and reported a successful strip of nothing.
+  copiesStrippedToo = expect "copies-stripped-too"
     (bundleOf {
-      drv = moduleLinked; name = "hostlibs-payload-wildcard"; hostLibs = [ "*.dll" ];
+      drv = moduleCopied; name = "hostlibs-copies";
+      hostLibs = hostDlls; hostBundle = hostGood;
     })
     "./lib/demo_plugin.dll ";
 
-  # The same names, copied rather than linked: this derivation produced them,
-  # so all four files stay. hostBundle is given, which before the fix would
-  # have failed the build -- the import arms claimed every matching name from
-  # the host whether or not the bundle already satisfied it.
-  payloadCopiesKept = expect "payload-copies-kept"
+  # A bin/ with no executable in it: the strip empties it, and Phase 6 has to
+  # tell "this build removed bin/x.dll" from "Phase 1 lost bin/x.dll". Before
+  # that arm existed this build failed with three "in the source derivation but
+  # not in the bundle" errors -- the strip and the verifier disagreeing about
+  # one decision.
+  moduleBinStripped = expect "module-bin-stripped"
     (bundleOf {
-      drv = moduleCopied; name = "hostlibs-payload-copies";
+      drv = moduleBinDlls; name = "hostlibs-module-bin";
       hostLibs = hostDlls; hostBundle = hostGood;
     })
-    "./lib/demo_plugin.dll ./lib/libgcc_s_seh-1.dll ./lib/libmcfgthread-2.dll ./lib/libstdc++-6.dll ";
+    "./lib/demo_plugin.dll ";
+
+  # ---- what the strip may NOT remove --------------------------------------
 
   # `extraDirs` is an explicit "carry this". The linked-in copies in lib/ go;
   # the caller's own copy under share/assets stays. Measured before the fix:
   # "- share/assets/libstdc++-6.dll (host-provided)", the directory shipped
   # empty, rc=0.
-  extraDirsPayloadKept = expect "extra-dirs-payload-kept"
+  extraDirsKept = expect "extra-dirs-kept"
     (bundleOf {
       drv = moduleWithAssets; name = "hostlibs-assets";
       hostLibs = hostDlls; hostBundle = hostGood;
@@ -351,31 +369,41 @@ in
     })
     "./lib/demo_plugin.dll ./share/assets/libstdc++-6.dll ";
 
-  # `bundlers.qtPlugin` appends `Qt*` to hostLibs ITSELF, and the PE match
-  # folds case, so it reads `qt*` and matches a Qt plugin's own
-  # `qtquick2plugin.dll`. Here the derivation's own Qt6Core.dll survives a
-  # `Qt*.dll` list while the linked-in runtime DLLs are stripped -- and the
-  # build only gets that far because the survivor makes the Qt-detection arm
-  # answer "host-provided", which is what `qtPayloadNotHostProvided` below
-  # controls for.
-  qtPayloadKept = expect "qt-payload-kept"
+  # THE BUNDLER-INJECTED PATTERN. `bundlers.<sys>.qtPlugin` appends `Qt*` to
+  # hostLibs itself -- a list the caller never sees -- and on the PE path that
+  # would DELETE, case-folded, matching a Qt plugin package's own output.
+  # Measured on the real Windows Qt bundle while it did: 816 PEs in, 796 out,
+  # exit 0. flake.nix now appends it only on a non-Windows target, so this
+  # bundle keeps its own Qt6Core.dll and everything else it was given.
+  qtPluginBundlerKeepsPayload = expect "qt-plugin-bundler-keeps-payload"
+    (qtPluginBundler qtNamedModule)
+    ("./lib/Qt6Core.dll ./lib/demo_plugin.dll ./lib/libgcc_s_seh-1.dll "
+     + "./lib/libmcfgthread-2.dll ./lib/libstdc++-6.dll ");
+
+  # The other half of the same rule, and the reason the gate is about WHO
+  # declared the pattern rather than about the pattern: the same file name, the
+  # same bundle, a CALLER-written `Qt*.dll` -- and it goes, because that is what
+  # the caller asked for. hostBundle then has to ship it, which is what makes
+  # the request checkable rather than merely obeyed.
+  callerQtStripsOwnQt = expect "caller-qt-strips-own-qt"
     (bundleOf {
-      drv = qtNamedApp; name = "hostlibs-qt-payload";
+      drv = qtNamedModule; name = "hostlibs-caller-qt";
+      hostLibs = hostDlls ++ [ "Qt*.dll" ]; hostBundle = hostWithQt;
+    })
+    "./lib/demo_plugin.dll ";
+
+  # The `pe_is_host_lib "$qt_lib_name"` arm in Qt detection, reached the one way
+  # it still can be: a DIRECTORY named like a Qt DLL, which the strip cannot
+  # remove (`find -type f`) and detection counts (`[ -e ]`). It answers
+  # "host-provided", so Phase 2b skips Qt staging and this builds. The control
+  # is `qtDirNotHostProvided` below, which is the same input without `Qt*` and
+  # dies demanding a Qt plugin directory.
+  qtDirHostProvided = expect "qt-dir-host-provided"
+    (bundleOf {
+      drv = qtDirModule; name = "hostlibs-qt-dir";
       hostLibs = hostDlls ++ [ "Qt*.dll" ]; hostBundle = hostGood;
     })
-    "./bin/Qt6Core.dll ./bin/demo_app.exe ";
-
-  # The same subject with NO hostBundle, which is the defect exactly as it
-  # shipped: `bundlers.qtPlugin` appends `Qt*` and passes no host bundle, so
-  # nothing adjudicated the claim and the deletion was silent. Measured against
-  # the pre-fix tree: exit 0 with a PE set of `./bin/demo_app.exe ` — the
-  # bundler had quietly removed the file it was packaging.
-  qtPayloadKeptUnverified = expect "qt-payload-kept-unverified"
-    (bundleOf {
-      drv = qtNamedApp; name = "hostlibs-qt-payload-u";
-      hostLibs = hostDlls ++ [ "Qt*" ];
-    })
-    "./bin/Qt6Core.dll ./bin/demo_app.exe ";
+    "./bin/Qt6Core.dll ./lib/demo_plugin.dll ";
 
   # ---- must FAIL, each on a different arm --------------------------------
   # Kept out of `checks` for the same reason extra-dirs-dirty is: `nix flake
@@ -421,20 +449,52 @@ in
     hostBundle = hostGood;
   };
 
-  # The floor, on the one shape that can still reach it: a derivation that
-  # produced no file of its own, so the payload rule has nothing to protect.
-  stripEverythingLinked = bundleOf {
-    drv = moduleAllLinked; name = "hostlibs-fail-stripall"; hostLibs = [ "*.dll" ];
+  # hostBundle on a target Nix cannot read. mkBundle's throwIf deliberately
+  # fires on `isWindowsStr == "0"` only, leaving "unknown" to bundle.sh, which
+  # resolves it to Unix in Phase 1c and refuses there -- an arm nothing reached
+  # until this subject, because every other stdenv-less shape also has no
+  # reason to pass a hostBundle. `removeAttrs` is how a real Windows tree with
+  # no stdenv is reproduced: a `builtins.storePath` cannot be written in a pure
+  # flake, and everything else about the derivation is unchanged.
+  hostBundleOnUnknownTarget = bundleOf {
+    drv = builtins.removeAttrs moduleLinked [ "stdenv" ];
+    name = "hostlibs-fail-unknown"; hostLibs = hostDlls; hostBundle = hostGood;
   };
 
-  # The control for `qtPayloadKept`: identical input, no `Qt*` in hostLibs. Qt
-  # is then detected and NOT host-provided, so Phase 2b goes looking for a Qt
+  # hostBundle that is not a directory at all. `pe_host_index` refuses it, and
+  # nothing reached that arm either: every other subject passes a runCommand
+  # output. A `.cpp` in the store is a store path a caller could plausibly
+  # paste in.
+  hostBundleNotADirectory = bundleOf {
+    drv = moduleLinked; name = "hostlibs-fail-notdir";
+    hostLibs = hostDlls; hostBundle = pluginSrc;
+  };
+
+  # The floor. `*.dll` is a list the caller is ALLOWED to write -- a declared
+  # pattern deletes -- but a bundle with no PE left in it cannot be what anyone
+  # meant, and it is the one case that needs no judgement about which file was
+  # the payload. Under the provenance rule this same subject built green.
+  stripEverything = bundleOf {
+    drv = moduleLinked; name = "hostlibs-fail-stripall"; hostLibs = [ "*.dll" ];
+  };
+
+  # The control for `qtDirHostProvided`: identical input, no `Qt*` in hostLibs.
+  # Qt is then detected and NOT host-provided, so Phase 2b goes looking for a Qt
   # plugin directory in a closure that has none and the build dies. That
-  # difference is the demonstration that the `pe_is_host_lib "$qt_lib_name"`
-  # arm is reached and changes the verdict -- bundle.sh used to carry a comment
-  # claiming it could not be.
-  qtPayloadNotHostProvided = bundleOf {
-    drv = qtNamedApp; name = "hostlibs-fail-qt-not-host";
+  # difference is the demonstration that the arm is reached and changes the
+  # verdict.
+  qtDirNotHostProvided = bundleOf {
+    drv = qtDirModule; name = "hostlibs-fail-qt-dir";
+    hostLibs = hostDlls; hostBundle = hostGood;
+  };
+
+  # The app shape. Windows resolves a host-provided DLL through the LOADING
+  # PROCESS's own directory; when the bundle has an executable of its own that
+  # directory is the bundle's bin/, where the stripped DLLs no longer are.
+  # Measured: such a bundle dies 0xC0000135 before main() with no output, and
+  # runs only with the host's bin/ on PATH. It used to build green here.
+  appShapeRefused = bundleOf {
+    drv = appLinked; name = "hostlibs-fail-app";
     hostLibs = hostDlls; hostBundle = hostGood;
   };
 

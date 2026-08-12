@@ -72,45 +72,75 @@ mkBundle {
 }
 ```
 
-Both bundle shapes are supported: an application (`bin/`) and a module whose
-whole output is `lib/<name>.dll`.
+**Only for a bundle that is loaded into something else.** On Windows a
+host-provided DLL is found because the loader searches the *loading process's*
+own directory. That is the host's directory when this bundle is a module
+(`lib/<name>.dll`, no executable of its own) and it is *this* bundle's `bin/`
+when the bundle has an `.exe` — where the stripped DLLs no longer are. So a
+`hostLibs` claim on a bundle that ships an executable is **refused at build
+time**: measured, such a bundle dies with `0xC0000135` before `main()` and
+prints nothing, and runs only with the host's `bin/` prepended to `PATH`.
 
 **What `hostLibs` may remove.** On ELF and Mach-O it filters what the bundler
 *adds*: a traced dependency matching the list is not copied in. On Windows the
 bundler also has to *delete*, because nixpkgs' `win-dll-link.sh` has already
 staged the import closure into the derivation's own output before the bundler
-sees it. Deleting is the more dangerous operation, so it is bounded by a
-provenance rule: **the strip may only remove a file that came along with the
-package** — one the bundler staged, or one `win-dll-link.sh` linked in from
-another store path — **never a file the derivation's own build produced.** A
-Qt plugin package bundled with `hostLibs = [ "Qt*" ]` therefore loses the Qt
-runtime DLLs and keeps `qtquick2plugin.dll`, and a DLL the caller carried in
-via `extraDirs` is never touched.
+sees it. Deleting is the more dangerous operation, so it is bounded by *who
+declared what*:
+
+- **A pattern you write deletes.** `hostLibs = [ "Qt*" ]` on a Qt plugin package
+  removes that package's own `Qt6*.dll` too. That is the contract, not an
+  accident — and `hostBundle` is how you make it checkable.
+- **A pattern the bundler injects does not.** `bundlers.<sys>.qtPlugin` appends
+  `Qt*` for you; it appends it only on non-Windows targets, where `hostLibs`
+  cannot delete anything.
+- **`extraDirs` is never touched.** Those directories are named by you, one by
+  one, as "carry this"; a name glob does not overrule that.
+- **A strip that would empty the bundle fails the build.**
 
 Do not read anything into the shape of the patterns. Cross-platform spellings
 *can* over-match — `libcrypto*` matches `libcrypto-3-x64.dll` — and the safety
-comes from the payload rule, from `hostBundle`, and from the build failing when
-a strip would empty the bundle.
+comes from the rules above, from `hostBundle`, and from the log naming every
+dropped file.
 
 **The host must also LOOK there.** A stripped module finds the host's DLLs
 because Windows searches the *loading process's own directory*, and some
-`LoadLibraryEx` flags remove precisely that directory from the search. Measured
-on Windows 11 x86-64 with one stripped module and one unstripped control:
+`LoadLibraryEx` flags remove precisely that directory from the search.
 
-| flags | what it means | stripped module | control |
-|---|---|---|---|
-| `0x0000` | default search order | **loads** | loads |
-| `0x0008` | `LOAD_WITH_ALTERED_SEARCH_PATH` | fails, 126 | loads |
-| `0x0100` | `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR` alone | fails, 126 | loads |
-| `0x1100` | `…DLL_LOAD_DIR｜…DEFAULT_DIRS` | **loads** | loads |
+Measured on Windows 11 x86-64 against the **real** `logos-package_manager`
+module (16 DLLs stripped, 3 kept), a host bundle shipping those 16, and the
+*unstripped* bundle of the same module as the control. The loading process's
+current directory holds none of the DLLs unless a row says otherwise:
+
+| flags | what it means | stripped | control | what the pair says |
+|---|---|---|---|---|
+| `0x1100` | `…DLL_LOAD_DIR｜…DEFAULT_DIRS` | **loads** | loads | the mode Logos uses; the strip is invisible |
+| `0x0008` | `LOAD_WITH_ALTERED_SEARCH_PATH` | fails, 126 | **loads** | the strip, and only the strip |
+| `0x0008` | same, CWD = the host's own `bin\` | **loads** | — | the current directory is still in that order |
+| `0x0000` | default search order | fails, 126 | fails, 126 | *not* the strip |
+| `0x0100` | `…SEARCH_DLL_LOAD_DIR` alone | fails, 126 | fails, 126 | *not* the strip |
+| `0x1000` | `…SEARCH_DEFAULT_DIRS` alone | fails, 126 | fails, 126 | *not* the strip |
+| `0x1100` | host missing one claimed DLL | fails, 126 | **loads** | the claim is load-bearing |
 
 `0x1100` is what logos-module's `preloadPluginWithOwnDirSearch`
 (`src/win_dll_search.h`) passes, which is why Logos modules may be stripped.
-The two failing modes substitute the module's own directory *for* the
-application directory instead of adding to it. Nothing at build time can see
-which mode a host will use, so this is a property of the host you must check
-once, by hand — `hostBundle` checks that the DLL is *there*, not that anyone
-will look.
+
+Read the table as a statement about which directories a mode searches, not as
+one verdict per flag — the three "not the strip" rows are why. A real module
+keeps private DLLs of its own beside it, and the default order does not search a
+loaded DLL's own directory at all, so `0x0000` fails on the *unstripped* bundle
+too; `0x0100` and `0x1000` each name only half of what is needed. And `0x0008`
+replaces the application directory while leaving the rest of the standard order
+in place, current directory included — so the same host, started from its own
+`bin\`, loads the same stripped module through `0x0008`.
+
+(An earlier revision of this table was measured on a synthetic single-DLL module
+and reported `0x0000` as loading. That is true only for a module with no private
+dependencies of its own, which no real Logos module is.)
+
+Nothing at build time can see which mode a host will use, or where it will be
+started from, so this is a property of the host you must check once, by hand —
+`hostBundle` checks that the DLL is *there*, not that anyone will look.
 
 Every `hostLibs` entry is a promise about another package's output, and on
 Windows a broken promise is silent — `LoadLibrary` fails with
