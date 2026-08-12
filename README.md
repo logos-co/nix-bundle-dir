@@ -75,11 +75,16 @@ mkBundle {
 **Only for a bundle that is loaded into something else.** On Windows a
 host-provided DLL is found because the loader searches the *loading process's*
 own directory. That is the host's directory when this bundle is a module
-(`lib/<name>.dll`, no executable of its own) and it is *this* bundle's `bin/`
-when the bundle has an `.exe` — where the stripped DLLs no longer are. So a
-`hostLibs` claim on a bundle that ships an executable is **refused at build
-time**: measured, such a bundle dies with `0xC0000135` before `main()` and
-prints nothing, and runs only with the host's `bin/` prepended to `PATH`.
+(`lib/<name>.dll`, no executable of its own) and it is the directory *this*
+bundle's `.exe` sits in when the bundle has one — where the stripped DLLs no
+longer are. So a `hostLibs` claim on a bundle that ships an executable is
+**refused at build time**, wherever in the bundle that executable is: the check
+is "does any PE in this tree have an executable image header", not "is there an
+`.exe` in `bin/`". Measured: such a bundle dies with `0xC0000135` before
+`main()` and prints nothing. It runs only if the deployment puts the host's
+`bin\` somewhere the loader searches for that *process* — prepended to `PATH`,
+or as the current directory, which is in the EXE search order too — and that is
+not something a build-time check can see.
 
 **What `hostLibs` may remove.** On ELF and Mach-O it filters what the bundler
 *adds*: a traced dependency matching the list is not copied in. On Windows the
@@ -107,10 +112,12 @@ dropped file.
 because Windows searches the *loading process's own directory*, and some
 `LoadLibraryEx` flags remove precisely that directory from the search.
 
-Measured on Windows 11 x86-64 against the **real** `logos-package_manager`
-module (16 DLLs stripped, 3 kept), a host bundle shipping those 16, and the
-*unstripped* bundle of the same module as the control. The loading process's
-current directory holds none of the DLLs unless a row says otherwise:
+Measured on Windows 11 x86-64 (AMD64) against the **real**
+`logos-package_manager-module` — `packages.x86_64-windows.lib`, bundled by this
+bundler: 19 PEs examined, 16 removed, 3 kept — a host bundle shipping those 16
+in its `bin\`, and the *unstripped* bundle of the same module as the control.
+The loading process's current directory is a scratch directory holding none of
+the DLLs unless a row says otherwise:
 
 | flags | what it means | stripped | control | what the pair says |
 |---|---|---|---|---|

@@ -38,13 +38,37 @@
               mkBundle = import ./mkBundle.nix { inherit pkgs; };
             }).nested;
         }
-        # x86_64-linux only. Every subject in there is a `pkgsCross.mingwW64`
-        # build: on aarch64-linux the mingw toolchain is not substitutable and
-        # `nix flake check` would spend hours compiling GCC, and on Darwin the
-        # cross stdenv does not evaluate at all. Restricting the ATTRIBUTE
-        # rather than making the subjects no-ops keeps a green check on the
-        # other systems from meaning "the PE contract passed" when it was never
-        # built.
+        # x86_64-linux only, and the reason is cost plus evidence — NOT
+        # impossibility. The two reasons this comment used to give were both
+        # measured false against this flake's own nixpkgs on 2026-08-12:
+        #
+        #   * "on Darwin the cross stdenv does not evaluate at all" —
+        #     `pkgsCross.mingwW64.stdenv.hostPlatform.isWindows` is true on
+        #     aarch64-darwin, a `pkgsCross.mingwW64` mkDerivation yields a
+        #     drvPath, and `tests/pe-hostlibs.nix.moduleStripped` through
+        #     `bundlers.aarch64-darwin.qtPlugin` evaluates to a real .drv.
+        #   * "on aarch64-linux the mingw toolchain is not substitutable and
+        #     `nix flake check` would spend hours compiling GCC" —
+        #     `nix build --dry-run` of that same subject reports 5 derivations
+        #     to build and 68 to fetch on aarch64-linux (5 and 10 on
+        #     aarch64-darwin). The 5 are the subject's own; the toolchain
+        #     substitutes.
+        #
+        # What is true: off x86_64-linux every `nix flake check` would pull a
+        # cross toolchain it otherwise never needs (60 MiB / 533 MiB unpacked on
+        # aarch64-darwin, 144 MiB / 950 MiB on aarch64-linux, from the same
+        # dry-runs), and of the subjects below exactly ONE has ever been built
+        # off x86_64-linux — `moduleStripped`, on aarch64-darwin, 2026-08-12,
+        # green. The rest are unbuilt there, and x86_64-darwin is unbuilt
+        # entirely.
+        #
+        # So the gate stays, matching tests/smoke.sh — which gates the same
+        # subjects on `$SYS` and announces the skip, and is what CI actually
+        # runs. Widening it is a change with its own evidence: build all of them
+        # on the new system and find out whether they pass, rather than editing
+        # this condition. Restricting the ATTRIBUTE rather than making the
+        # subjects no-ops keeps a green check on the other systems from meaning
+        # "the PE contract passed" when it was never built.
         // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
           pe-hostlibs-module          = peHostLibs.moduleStripped;
           pe-hostlibs-module-verified = peHostLibs.moduleStrippedVerified;
@@ -55,17 +79,24 @@
           # The declaration rule: what the strip may NOT remove, and who may
           # ask for a removal at all.
           pe-hostlibs-extradirs       = peHostLibs.extraDirsKept;
+          # ...and that the SWEEP may not carry it out either.
+          pe-hostlibs-extradirs-mirror = peHostLibs.extraDirsNotMirrored;
           pe-hostlibs-qtplugin-inject = peHostLibs.qtPluginBundlerKeepsPayload;
           pe-hostlibs-caller-qt       = peHostLibs.callerQtStripsOwnQt;
           pe-hostlibs-qt-dir          = peHostLibs.qtDirHostProvided;
         });
 
       # Subjects that MUST fail to build. Kept out of `checks` on purpose:
-      # `nix flake check` would build them and call the repo broken. smoke.sh
-      # builds extra-dirs-dirty expecting the failure, and asserts what the
-      # failure says; the pe-hostlibs entries are built the same way by hand
-      # (`nix build .#tests.x86_64-linux.<name>` — each must exit 1, and each
-      # exits 1 on a DIFFERENT arm, so the message is the assertion).
+      # `nix flake check` would build them and call the repo broken.
+      #
+      # tests/smoke.sh builds every one of them — extra-dirs-dirty and the
+      # pe-hostlibs entries alike — expecting the failure, and asserts what the
+      # failure SAYS: each exits 1 on a different arm, so the message is the
+      # assertion and the exit status alone would not distinguish a subject that
+      # failed for the wrong reason. (This used to say the pe-hostlibs entries
+      # were built "by hand"; the same commit that wrote that added the smoke.sh
+      # loop, so it was stale on arrival. By hand still works —
+      # `nix build .#tests.x86_64-linux.<name>` — it is just not how they run.)
       tests = forAllSystems ({ pkgs, system, ... }:
         let peHostLibs = import ./tests/pe-hostlibs.nix {
               inherit pkgs;
@@ -90,6 +121,7 @@
           pe-hostlibs-strip-everything = peHostLibs.stripEverything;
           pe-hostlibs-qt-dir-not-host  = peHostLibs.qtDirNotHostProvided;
           pe-hostlibs-app-refused      = peHostLibs.appShapeRefused;
+          pe-hostlibs-app-in-lib       = peHostLibs.appInLibRefused;
           pe-hostlibs-unclaimed        = peHostLibs.moduleUnclaimed;
         });
 

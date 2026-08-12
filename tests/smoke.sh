@@ -93,7 +93,7 @@ echo
 #
 # This block exists because the contract in tests/pe-hostlibs.nix was reachable
 # only through `nix flake check`, and CI does not run `nix flake check` — it
-# runs this file. Ten subjects that must build and eleven that must be refused
+# runs this file. The subjects that must build and the ones that must be refused
 # were therefore built by nobody, which is the same as not having them.
 #
 # x86_64-linux only, and by SYSTEM rather than by `uname`: every subject is a
@@ -107,7 +107,8 @@ if [ "$SYS" = "x86_64-linux" ]; then
   # class here is a bundle that is missing a file and exits 0.
   for c in pe-hostlibs-module pe-hostlibs-module-verified pe-hostlibs-claimed-only \
            pe-hostlibs-mixed-case pe-hostlibs-copies pe-hostlibs-bin-stripped \
-           pe-hostlibs-extradirs pe-hostlibs-qtplugin-inject \
+           pe-hostlibs-extradirs pe-hostlibs-extradirs-mirror \
+           pe-hostlibs-qtplugin-inject \
            pe-hostlibs-caller-qt pe-hostlibs-qt-dir; do
     if nix build -L "$FLAKE#checks.$SYS.$c" --no-link > "pe-$c.log" 2>&1; then
       ok "$c"
@@ -145,6 +146,7 @@ pe-hostlibs-host-not-dir|which is not a directory
 pe-hostlibs-strip-everything|ERROR: the hostLibs strip removed every PE in this bundle
 pe-hostlibs-qt-dir-not-host|no Qt plugin directory for this
 pe-hostlibs-app-refused|but this bundle contains an executable of its own
+pe-hostlibs-app-in-lib|lib/demo_app.exe
 pe-hostlibs-unclaimed|DLL import(s) could not be resolved
 PE_FAILS
 else

@@ -76,10 +76,11 @@
 #
 # What it CANNOT check is the other half of the promise: that the host will
 # look in its own directory when it loads this module. Measured on Windows 11
-# x86-64 against the REAL logos-package_manager module (16 DLLs stripped, 3
-# kept) and a host bundle shipping those 16, with the UNSTRIPPED bundle of the
-# same module as the control and the process's CURRENT DIRECTORY holding none
-# of them:
+# x86-64 (AMD64) against the REAL logos-package_manager-module —
+# `packages.x86_64-windows.lib`, bundled by this bundler: 19 PEs examined, 16
+# removed, 3 kept — and a host bundle shipping those 16 in its bin\, with the
+# UNSTRIPPED bundle of the same module as the control and the process's CURRENT
+# DIRECTORY a scratch directory holding none of them:
 #
 #                                          stripped   control
 #   flags 0x1100 DLL_LOAD_DIR|DEFAULT_DIRS  LOADS      LOADS
@@ -91,10 +92,13 @@
 #   flags 0x1100, host missing one claim    126        LOADS   <- the claim
 #
 # logos-module passes 0x1100 (src/win_dll_search.h), which is the row that
-# matters. Only two rows are attributable to the strip at all — the ones where
-# the control differs — and reading the others as flag verdicts is how the
-# previous version of this table got 0x0000 wrong: it was measured on a
-# synthetic module with no private dependencies, and a real module keeps its own
+# matters. Only the rows where the CONTROL differs are attributable to the strip
+# at all: 0x0008 and the missing-claim row. The three marked "not the strip"
+# fail identically on a module this bundler never touched, so they are facts
+# about which directories each mode searches and about a real module's own
+# private DLLs — quoting one of them as a verdict on hostLibs is how the
+# previous version of this table got 0x0000 wrong. That version was measured on
+# a synthetic module with no private dependencies; a real module keeps its own
 # DLLs beside it, which the default order never searches.
 #
 # The CWD qualifier is load-bearing too: 0x0008 substitutes the module's
@@ -103,12 +107,15 @@
 # bin\ loads the same stripped module through 0x0008.
 #
 # And it only applies to a MODULE. A bundle with an executable of its own is
-# refused by bundle.sh the moment hostLibs would drop anything, because for that
-# shape the loading process is the bundle's own .exe and the directory Windows
-# searches is the bundle's own bin\ — the host's DLLs are not there, and this
-# argument would be verifying a directory the loader never consults. Measured:
-# such a bundle run from its own bin\ dies 0xC0000135 with no output, and runs
-# only with the host's bin\ on PATH.
+# refused by bundle.sh the moment hostLibs would drop anything — an executable
+# ANYWHERE in the bundle, not only one in bin\, which is what that scan looked
+# at while this sentence already said otherwise. For that shape the loading
+# process is the bundle's own .exe and the directory Windows searches is the one
+# that .exe sits in — the host's DLLs are not there, and this argument would be
+# verifying a directory the loader never consults. Measured: such a bundle run
+# from its own directory dies 0xC0000135 with no output, and runs only when the
+# deployment puts the host's bin\ where the loader looks for that process (on
+# PATH, or as the current directory).
 #
 # Not consulted on ELF/Mach-O, and refused there rather than silently dropped —
 # see the `throwIf` below. Those paths are unchanged by this argument, down to

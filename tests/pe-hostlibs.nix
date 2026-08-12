@@ -156,6 +156,35 @@ let
     '';
   };
 
+  # SHAPE 1d2: the same extraDirs entry, but with an IMPORTER inside it, and a
+  # bin/ for the sweep to mirror into. `extraDirs` keeps the host-matched DLL
+  # (rule 2); the sweep then sees an importer whose dependency sits beside it,
+  # and its beside-the-importer MIRROR copies that dependency into bin/ -- out
+  # of the one directory the strip may not touch and into one where nothing
+  # keeps it. Measured on the revision before the sweep's two tests were
+  # reordered: the strip printed `- bin/libstdc++-6.dll (host-provided)`, the
+  # sweep printed `~ libstdc++-6.dll mirrored into bin/ from share/assets`, and
+  # the finished bundle shipped bin/libstdc++-6.dll, exit 0. The comment on
+  # `pe_strip_host_libs` asserted at the time that nothing hostLibs matches is
+  # ever staged "into an extraDir or anywhere else".
+  #
+  # bin/ holds the plugin rather than being empty so the shape is a real library
+  # package rather than a directory that exists to make a code path reachable.
+  moduleAssetsImporter = mingw.stdenv.mkDerivation {
+    name = "hostlibs-module-assets-importer";
+    dontUnpack = true;
+    dontFixup = true;
+    buildPhase = "$CXX -shared -o demo_plugin.dll ${pluginSrc}";
+    installPhase = ''
+      mkdir -p $out/lib $out/bin $out/share/assets
+      cp demo_plugin.dll $out/lib/
+      cp demo_plugin.dll $out/bin/
+      cp demo_plugin.dll $out/share/assets/asset_plugin.dll
+      cp ${dllDir}/libstdc++-6.dll ${dllDir}/libgcc_s_seh-1.dll ${mcfgDll} $out/share/assets/
+      chmod +w $out/share/assets/*.dll
+    '';
+  };
+
   # SHAPE 1e: a library package's bin/ -- DLLs and no executable, which is what
   # `linkDLLsInfolder "$out/bin"` leaves behind. Nothing in it can be a process,
   # so the app-shape refusal does not apply, and it is the shape that reaches
@@ -218,6 +247,27 @@ let
     installPhase = ''
       mkdir -p $out/bin && cp demo_app.exe $out/bin/
       ln -s ${dllDir}/libstdc++-6.dll ${dllDir}/libgcc_s_seh-1.dll ${mcfgDll} $out/bin/
+    '';
+  };
+
+  # SHAPE 2b: an executable that is NOT in an application directory. There is no
+  # bin/ at all, so the refusal's scan used to return before looking at anything
+  # -- it resolved bin/ and gave up when there was none -- while README.md and
+  # mkBundle.nix both said, without qualification, that a bundle shipping an
+  # executable is refused. The shape is not a curiosity: the loader searches the
+  # directory the .exe is in, which here is lib/, and lib/ is exactly what the
+  # strip empties.
+  appInLib = mingw.stdenv.mkDerivation {
+    name = "hostlibs-app-in-lib";
+    dontUnpack = true;
+    dontFixup = true;
+    buildPhase = ''
+      $CXX -shared -o demo_plugin.dll ${pluginSrc}
+      $CXX -o demo_app.exe ${appSrc}
+    '';
+    installPhase = ''
+      mkdir -p $out/lib && cp demo_plugin.dll demo_app.exe $out/lib/
+      ln -s ${dllDir}/libstdc++-6.dll ${dllDir}/libgcc_s_seh-1.dll ${mcfgDll} $out/lib/
     '';
   };
 
@@ -369,6 +419,27 @@ in
     })
     "./lib/demo_plugin.dll ./share/assets/libstdc++-6.dll ";
 
+  # ...and the strip is not the only thing that has to respect that. The sweep
+  # WRITES: its beside-the-importer rule mirrors a dependency into bin/, and it
+  # used to do that before asking whether hostLibs claimed the name, so a
+  # host-matched DLL travelled out of the extraDirs entry and into bin/. The
+  # assertion is therefore about bin/ as much as about share/assets: the three
+  # host DLLs stay where the caller put them and appear NOWHERE else.
+  #
+  # Both `./bin/demo_plugin.dll` and `./share/assets/asset_plugin.dll` are in the
+  # expected set for a reason -- the first is what makes bin/ a real destination
+  # to mirror into, the second is the importer that triggers the mirror. Drop
+  # either and the subject stops reaching the arm it is written for.
+  extraDirsNotMirrored = expect "extra-dirs-not-mirrored"
+    (bundleOf {
+      drv = moduleAssetsImporter; name = "hostlibs-assets-importer";
+      hostLibs = hostDlls; hostBundle = hostGood;
+      extraDirs = [ "share/assets" ];
+    })
+    ("./bin/demo_plugin.dll ./lib/demo_plugin.dll "
+     + "./share/assets/asset_plugin.dll ./share/assets/libgcc_s_seh-1.dll "
+     + "./share/assets/libmcfgthread-2.dll ./share/assets/libstdc++-6.dll ");
+
   # THE BUNDLER-INJECTED PATTERN. `bundlers.<sys>.qtPlugin` appends `Qt*` to
   # hostLibs itself -- a list the caller never sees -- and on the PE path that
   # would DELETE, case-folded, matching a Qt plugin package's own output.
@@ -495,6 +566,18 @@ in
   # runs only with the host's bin/ on PATH. It used to build green here.
   appShapeRefused = bundleOf {
     drv = appLinked; name = "hostlibs-fail-app";
+    hostLibs = hostDlls; hostBundle = hostGood;
+  };
+
+  # The same refusal, on a bundle with no application directory at all: the .exe
+  # is in lib/. The scan behind the refusal used to look only inside bin/, one
+  # level deep, so this built green while README.md and mkBundle.nix both
+  # described it as refused. It is the same failure as `appShapeRefused` -- the
+  # loading process is this bundle's own .exe and the directory Windows searches
+  # is the directory that .exe sits in, which is the directory the strip just
+  # emptied.
+  appInLibRefused = bundleOf {
+    drv = appInLib; name = "hostlibs-fail-app-in-lib";
     hostLibs = hostDlls; hostBundle = hostGood;
   };
 
