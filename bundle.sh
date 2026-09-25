@@ -1993,6 +1993,31 @@ echo "Phase 2: Tracing shared library dependencies..."
 declare -A visited
 declare -A framework_map
 framework_count=0
+# Two different libraries can share a basename (Apple's libiconv-109 and GNU
+# libiconv-1.17 are both libiconv.2.dylib). The first owns lib/<name>; each
+# other one is staged at lib/alt/<store name>/<name>, keyed here by the
+# dependency path its consumers name, so Phase 3 points them at their own.
+declare -A collision_map
+
+stage_name_collision() {
+  local lib_path="$1" real_path="$2" lib_name="$3"
+  local store_name
+  store_name="$(echo "$real_path" | sed -E 's|^/nix/store/([^/]+)/.*|\1|')"
+  if [ "$IS_DARWIN" != "1" ]; then
+    echo "  WARNING: $real_path is not the $lib_name already in lib/; its consumers" >&2
+    echo "  will load that one instead.  Only Mach-O bundles keep both." >&2
+    return 0
+  fi
+  local rel="alt/$store_name/$lib_name"
+  if [ ! -e "$out/lib/$rel" ]; then
+    mkdir -p "$out/lib/alt/$store_name"
+    cp -L "$real_path" "$out/lib/$rel"
+    chmod u+w "$out/lib/$rel" 2>/dev/null || true
+    echo "  $lib_name (another library of that name: lib/$rel)"
+  fi
+  collision_map[$lib_path]="$rel"
+  collision_map[$real_path]="$rel"
+}
 
 collect_lib() {
   local lib_path="$1"
@@ -2059,6 +2084,8 @@ collect_lib() {
     fi
     chmod u+w "$out/lib/$lib_name" 2>/dev/null || true
     echo "  $lib_name"
+  elif ! cmp -s "$real_path" "$(realpath "$out/lib/$lib_name")"; then
+    stage_name_collision "$lib_path" "$real_path" "$lib_name"
   fi
 
   trace_deps "$real_path"
@@ -3205,7 +3232,10 @@ elif [ "$IS_DARWIN" = "1" ]; then
       dep="$(echo "$line" | sed -E 's/^[[:space:]]*([^[:space:]]+).*/\1/')"
       if [[ "$dep" == /nix/store/* ]]; then
         lib_name="$(basename "$dep")"
-        if is_host_lib "$lib_name"; then
+        if [[ -n "${collision_map[$dep]:-}" ]]; then
+          install_name_tool -change "$dep" "$lib_prefix/${collision_map[$dep]}" "$f" 2>/dev/null || \
+            echo "  Warning: install_name_tool -change failed for $dep in $f"
+        elif is_host_lib "$lib_name"; then
           # Host-provided lib — rewrite to @rpath/ so the host app resolves it
           if [[ -n "${framework_map[$lib_name]:-}" ]]; then
             install_name_tool -change "$dep" "@rpath/${framework_map[$lib_name]}" "$f" 2>/dev/null || \
@@ -3289,7 +3319,11 @@ elif [ "$IS_DARWIN" = "1" ]; then
         fi
       fi
       if [ "$needs_rewrite" = "1" ]; then
-        if is_host_lib "$id_name"; then
+        if [[ "$f" == "$out/lib/alt/"* ]]; then
+          # Named by where it is, not as the lib/<name> it shares a name with.
+          install_name_tool -id "@loader_path/$id_name" "$f" 2>/dev/null || \
+            echo "  Warning: install_name_tool -id failed for $f"
+        elif is_host_lib "$id_name"; then
           # Host-provided lib — set install name to @rpath/
           if [[ -n "${framework_map[$id_name]:-}" ]]; then
             install_name_tool -id "@rpath/${framework_map[$id_name]}" "$f" 2>/dev/null || \
