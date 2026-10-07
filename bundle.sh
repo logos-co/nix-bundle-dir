@@ -58,6 +58,68 @@ is_portable_ref() {
   return 1
 }
 
+# --- Spawn-free helpers -----------------------------------------------------
+# The phases below run per file and per dependency line, where every $(...) is
+# a fork (3-6 ms on macOS); on a Qt app that came to minutes. These return
+# through REPLY: call them directly, never via $(...), or a memo is lost.
+
+# First whitespace-delimited token of an `otool -L` line; the same result as
+# echo "$1" | sed -E 's/^[[:space:]]*([^[:space:]]+).*/\1/' for every line otool
+# prints (they never start with '-' and are never blank).
+_first_token() {
+  local s="${1#"${1%%[![:space:]]*}"}"
+  REPLY="${s%%[[:space:]]*}"
+}
+
+# `file -b` for every path listed in $1 (one per line), in one process.
+declare -A _ftype=()
+_classify() {
+  local list="$1" i
+  local -a paths=() types=()
+  _ftype=()
+  mapfile -t paths < "$list"
+  [ "${#paths[@]}" -gt 0 ] || return 0
+  mapfile -t types < <(file -b -f "$list" 2>/dev/null)
+  # A count mismatch would misalign every answer: classify nothing and let
+  # _ftype_of fall back to one `file` per path.
+  [ "${#types[@]}" -eq "${#paths[@]}" ] || return 0
+  for i in "${!paths[@]}"; do _ftype["${paths[i]}"]="${types[i]}"; done
+}
+_ftype_of() {
+  if [ -n "${_ftype[$1]+x}" ]; then REPLY="${_ftype[$1]}"; return 0; fi
+  REPLY="$(file -b "$1" 2>/dev/null)"
+}
+
+# Every regular file under $1, one per line, in `find` order, into file $2.
+_list_files() { find "$1" -type f > "$2"; }
+
+declare -A _rel_cache=()
+_rel_to_lib() {
+  if [ -z "${_rel_cache[$1]+x}" ]; then
+    _rel_cache[$1]="$(realpath --relative-to="$1" "$out/lib")"
+  fi
+  REPLY="${_rel_cache[$1]}"
+}
+
+# `otool -D "$1" | tail -n +2 | head -1 | xargs`, parsed here. Falls back to
+# the real xargs where its quote and option handling could matter.
+_otool_install_id() {
+  local t l1="" l2="" IFS=$' \t\n'
+  local -a w=()
+  t="$(otool -D "$1" 2>/dev/null)" || true
+  { IFS= read -r l1; IFS= read -r l2; } <<< "$t" || true
+  case "$l2" in
+    *[\'\"\\]*) REPLY="$(printf '%s\n' "$l2" | xargs)" || true; return 0 ;;
+  esac
+  read -ra w <<< "$l2" || true
+  case "${w[0]-}" in
+    -*) REPLY="$(printf '%s\n' "$l2" | xargs)" || true; return 0 ;;
+  esac
+  REPLY="${w[*]-}"
+}
+
+bundle_work="$(mktemp -d)"
+
 # ===========================================================================
 # Phase 1 — Copy executables and libraries from the main derivation
 # ===========================================================================
@@ -1996,11 +2058,9 @@ framework_count=0
 
 collect_lib() {
   local lib_path="$1"
-  local lib_name
-  lib_name="$(basename "$lib_path")"
-
   [[ -z "${visited[$lib_path]:-}" ]] || return 0
   visited[$lib_path]=1
+  local lib_name="${lib_path##*/}"
 
   if is_system_lib "$lib_name"; then
     echo "  Skipping (system): $lib_name"
@@ -2051,8 +2111,7 @@ collect_lib() {
     mkdir -p "$out/lib"
     cp -a "$lib_path" "$out/lib/"
     if [ -L "$lib_path" ]; then
-      local target_name
-      target_name="$(basename "$real_path")"
+      local target_name="${real_path##*/}"
       if [ ! -e "$out/lib/$target_name" ]; then
         cp -a "$real_path" "$out/lib/"
       fi
@@ -2067,7 +2126,8 @@ collect_lib() {
 trace_deps() {
   local bin="$1"
   local filetype
-  filetype="$(file -b "$bin" 2>/dev/null)" || return 0
+  _ftype_of "$bin" || return 0
+  filetype="$REPLY"
 
   if [[ "$filetype" == *Mach-O* ]]; then
     # Collect rpath dirs for resolving @rpath/ references
@@ -2079,7 +2139,7 @@ trace_deps() {
     while IFS= read -r line; do
       # Skip fat binary architecture headers
       [[ "$line" == *"(architecture"* ]] && continue
-      dep="$(echo "$line" | sed -E 's/^[[:space:]]*([^[:space:]]+).*/\1/')"
+      _first_token "$line"; dep="$REPLY"
       if [[ "$dep" == /nix/store/* ]] && [ -f "$dep" ]; then
         collect_lib "$dep"
       elif [[ "$dep" == @rpath/* ]]; then
@@ -2161,6 +2221,8 @@ if [ "$IS_WINDOWS" = "1" ]; then
 else
 
 if [ -d "$out/bin" ]; then
+  find "$out/bin" "$out/lib" -maxdepth 1 -type f > "$bundle_work/p2" 2>/dev/null || true
+  _classify "$bundle_work/p2"
   for f in "$out"/bin/*; do
     [ -f "$f" ] || continue
     trace_deps "$f"
@@ -3193,18 +3255,25 @@ elif [ "$IS_DARWIN" = "1" ]; then
 
   rewrite_macho() {
     local f="$1"
-    local f_dir
-    f_dir="$(dirname "$f")"
+    local f_dir="${f%/*}"
     local rel_to_lib
-    rel_to_lib="$(loader_path_to_lib "$f_dir")"
+    _rel_to_lib "$f_dir"; rel_to_lib="$REPLY"
     local lib_prefix="@loader_path/$rel_to_lib"
 
-    otool -L "$f" 2>/dev/null | tail -n +2 | while IFS= read -r line; do
+    # Read once into an array instead of piping into a subshell loop; dep and
+    # lib_name are local so nothing leaks out of the function as it did not
+    # leak out of that subshell.
+    local otool_out line dep lib_name i
+    local -a ol=()
+    otool_out="$(otool -L "$f" 2>/dev/null)"
+    mapfile -t ol <<< "$otool_out"
+    for ((i = 1; i < ${#ol[@]}; i++)); do
+      line="${ol[i]}"
       # Skip fat binary architecture headers (e.g. "/path/to/lib (architecture arm64):")
       [[ "$line" == *"(architecture"* ]] && continue
-      dep="$(echo "$line" | sed -E 's/^[[:space:]]*([^[:space:]]+).*/\1/')"
+      _first_token "$line"; dep="$REPLY"
       if [[ "$dep" == /nix/store/* ]]; then
-        lib_name="$(basename "$dep")"
+        lib_name="${dep##*/}"
         if is_host_lib "$lib_name"; then
           # Host-provided lib — rewrite to @rpath/ so the host app resolves it
           if [[ -n "${framework_map[$lib_name]:-}" ]]; then
@@ -3231,7 +3300,7 @@ elif [ "$IS_DARWIN" = "1" ]; then
         fi
       elif [[ "$dep" == @rpath/* ]]; then
         local rpath_suffix="${dep#@rpath/}"
-        lib_name="$(basename "$dep")"
+        lib_name="${dep##*/}"
         if is_host_lib "$lib_name"; then
           : # Host-provided — already an @rpath/ reference, leave as-is
         elif [[ "$rpath_suffix" == *.framework/* ]]; then
@@ -3255,7 +3324,7 @@ elif [ "$IS_DARWIN" = "1" ]; then
         fi
       elif ! is_portable_ref "$dep"; then
         # Non-portable absolute path (e.g. build dir leak) — rewrite if we have the lib
-        lib_name="$(basename "$dep")"
+        lib_name="${dep##*/}"
         if [ -f "$out/lib/$lib_name" ] || [ -L "$out/lib/$lib_name" ]; then
           install_name_tool -change "$dep" "$lib_prefix/$lib_name" "$f" 2>/dev/null || \
             echo "  Warning: install_name_tool -change failed for $dep in $f"
@@ -3265,14 +3334,17 @@ elif [ "$IS_DARWIN" = "1" ]; then
 
     # Fix install name
     local current_id
-    current_id="$(otool -D "$f" 2>/dev/null | tail -n +2 | head -1 | xargs)" || true
+    _otool_install_id "$f"; current_id="$REPLY"
     if [[ -z "$current_id" ]]; then
-      # otool -D returned nothing (e.g. MH_BUNDLE); check first otool -L entry
-      current_id="$(otool -L "$f" 2>/dev/null | sed -n '2p' | sed -E 's/^[[:space:]]*([^[:space:]]+).*/\1/')" || true
+      # otool -D returned nothing (e.g. MH_BUNDLE); check first otool -L entry,
+      # read again because the -change calls above rewrote it
+      local l2=""
+      otool_out="$(otool -L "$f" 2>/dev/null)" || true
+      { IFS= read -r line; IFS= read -r l2; } <<< "$otool_out" || true
+      _first_token "$l2"; current_id="$REPLY"
     fi
     if [[ -n "$current_id" ]]; then
-      local id_name
-      id_name="$(basename "$current_id")"
+      local id_name="${current_id##*/}"
       local needs_rewrite=0
       if ! is_portable_ref "$current_id"; then
         needs_rewrite=1
@@ -3329,12 +3401,14 @@ elif [ "$IS_DARWIN" = "1" ]; then
     install_name_tool -add_rpath "$lib_prefix" "$f" 2>/dev/null || true
   }
 
-  find "$out" -type f | while IFS= read -r f; do
-    filetype="$(file -b "$f" 2>/dev/null)" || continue
-    [[ "$filetype" == *Mach-O* ]] || continue
+  _list_files "$out" "$bundle_work/p3"
+  _classify "$bundle_work/p3"
+  while IFS= read -r -u 9 f; do
+    _ftype_of "$f" || continue
+    [[ "$REPLY" == *Mach-O* ]] || continue
     echo "  ${f#$out/}"
     rewrite_macho "$f"
-  done
+  done 9< "$bundle_work/p3"
 
 else
 
@@ -3380,13 +3454,16 @@ else
     esac
   }
 
-  find "$out" -type f | while IFS= read -r f; do
-    filetype="$(file -b "$f" 2>/dev/null)" || continue
+  _list_files "$out" "$bundle_work/p3"
+  _classify "$bundle_work/p3"
+  while IFS= read -r -u 9 f; do
+    _ftype_of "$f" || continue
+    filetype="$REPLY"
     [[ "$filetype" == *ELF* ]] || continue
     echo "  ${f#$out/}"
 
-    f_dir="$(dirname "$f")"
-    rel_to_lib="$(loader_path_to_lib "$f_dir")"
+    f_dir="${f%/*}"
+    _rel_to_lib "$f_dir"; rel_to_lib="$REPLY"
 
     # Set rpath to: same-dir first, then $out/lib.
     # The same-dir entry ($ORIGIN) lets binaries outside $out/lib find sibling
@@ -3422,7 +3499,7 @@ else
     # rpath entirely, so they must be converted to bare names.
     while IFS= read -r needed_entry; do
       if [[ "$needed_entry" == /nix/store/* ]]; then
-        bare_name="$(basename "$needed_entry")"
+        bare_name="${needed_entry##*/}"
         patchelf --replace-needed "$needed_entry" "$bare_name" "$f" 2>/dev/null || \
           echo "  Warning: patchelf --replace-needed failed for $needed_entry in $f"
       fi
@@ -3437,7 +3514,7 @@ else
 
     interp="$(patchelf --print-interpreter "$f" 2>/dev/null)" || true
     if [[ -n "${interp:-}" && "$interp" == /nix/store/* ]]; then
-      interp_name="$(basename "$interp")"
+      interp_name="${interp##*/}"
       if [ -f "$out/lib/$interp_name" ]; then
         patchelf --set-interpreter "$out/lib/$interp_name" "$f" 2>/dev/null || \
           echo "  Warning: patchelf --set-interpreter failed for $f"
@@ -3463,7 +3540,7 @@ else
         fi
       fi
     fi
-  done
+  done 9< "$bundle_work/p3"
 
 fi
 
@@ -3472,12 +3549,14 @@ fi
 # ===========================================================================
 if [ "$IS_DARWIN" = "1" ]; then
   echo "Phase 4: Code signing..."
-  find "$out" -type f | while IFS= read -r f; do
-    filetype="$(file -b "$f" 2>/dev/null)" || continue
-    [[ "$filetype" == *Mach-O* ]] || continue
+  _list_files "$out" "$bundle_work/p4"
+  _classify "$bundle_work/p4"
+  while IFS= read -r -u 9 f; do
+    _ftype_of "$f" || continue
+    [[ "$REPLY" == *Mach-O* ]] || continue
     codesign -f -s - "$f" 2>/dev/null || \
       echo "  Warning: codesign failed for $f"
-  done
+  done 9< "$bundle_work/p4"
 fi
 
 # ===========================================================================
@@ -4186,10 +4265,15 @@ check_macho() {
   local rel="${f#$test_dir/}"
 
   # Check load commands (otool -L)
-  otool -L "$f" 2>/dev/null | tail -n +2 | while IFS= read -r line; do
+  local otool_out line dep i
+  local -a ol=()
+  otool_out="$(otool -L "$f" 2>/dev/null)"
+  mapfile -t ol <<< "$otool_out"
+  for ((i = 1; i < ${#ol[@]}; i++)); do
+    line="${ol[i]}"
     # Skip fat binary architecture headers (e.g. "/path/to/lib (architecture arm64):")
     [[ "$line" == *"(architecture"* ]] && continue
-    dep="$(echo "$line" | sed -E 's/^[[:space:]]*([^[:space:]]+).*/\1/')"
+    _first_token "$line"; dep="$REPLY"
     if ! is_portable_ref "$dep"; then
       echo "  ERROR: $rel has non-portable load command: $dep"
       echo "1" >> "$test_dir/.errors"
@@ -4198,7 +4282,7 @@ check_macho() {
 
   # Check install name (otool -D)
   local install_id
-  install_id="$(otool -D "$f" 2>/dev/null | tail -n +2 | head -1 | xargs)" || true
+  _otool_install_id "$f"; install_id="$REPLY"
   if [[ -n "$install_id" ]] && ! is_portable_ref "$install_id"; then
     echo "  ERROR: $rel has non-portable install name: $install_id"
     echo "1" >> "$test_dir/.errors"
@@ -4258,14 +4342,17 @@ check_elf() {
   done
 }
 
-find "$test_dir" -type f | while IFS= read -r f; do
-  filetype="$(file -b "$f" 2>/dev/null)" || continue
+_list_files "$test_dir" "$bundle_work/p6"
+_classify "$bundle_work/p6"
+while IFS= read -r -u 9 f; do
+  _ftype_of "$f" || continue
+  filetype="$REPLY"
   if [[ "$filetype" == *Mach-O* ]]; then
     check_macho "$f"
   elif [[ "$filetype" == *ELF* ]]; then
     check_elf "$f"
   fi
-done
+done 9< "$bundle_work/p6"
 
 # Check for /nix/ paths embedded in binary data.
 # PE is included ON WINDOWS: this check is the one part of Phase 6 that is
@@ -4280,8 +4367,11 @@ done
 # with one appended /nix/ line exits 0 on the base bundler and 1 with the arm
 # unguarded.
 echo "  Checking for embedded /nix/ paths..."
-find "$test_dir" -type f | while IFS= read -r f; do
-  filetype="$(file -b "$f" 2>/dev/null)" || continue
+# Same listing as above: checking adds only $test_dir/.errors, plain text that
+# this scan skips anyway, and leaves the order of everything else unchanged.
+while IFS= read -r -u 9 f; do
+  _ftype_of "$f" || continue
+  filetype="$REPLY"
   case "$filetype" in
     *Mach-O*|*ELF*) ;;
     *PE32*)         [ "$IS_WINDOWS" = "1" ] || continue ;;
@@ -4322,7 +4412,7 @@ find "$test_dir" -type f | while IFS= read -r f; do
       done
     fi
   fi
-done
+done 9< "$bundle_work/p6"
 
 if [ -f "$test_dir/.errors" ]; then
   error_count="$(wc -l < "$test_dir/.errors")"
