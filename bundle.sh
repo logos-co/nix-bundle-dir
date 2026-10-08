@@ -120,6 +120,54 @@ _otool_install_id() {
 
 bundle_work="$(mktemp -d)"
 
+# Run "$1" once per path listed in file "$2", up to $NIX_BUILD_CORES at a time.
+# Each item's stdout and stderr are buffered and replayed in LIST order — the
+# order of the loop this replaces — so the build log does not depend on
+# scheduling, and replay stops at the first failed item, as the loop would.
+# Items only modify their own file; the state they read is set up beforehand.
+par_map() {
+  local fn="$1" list="$2" d n=0 k running=0 rc f
+  local max="${NIX_BUILD_CORES:-1}"
+  case "$max" in ''|*[!0-9]*|0) max=1 ;; esac
+  d="$(mktemp -d)"
+  while IFS= read -r -u 9 f; do
+    n=$((n + 1))
+    ( set +e; ( set -e; "$fn" "$f" ) < /dev/null > "$d/$n.out" 2> "$d/$n.err"; echo "$?" > "$d/$n.rc" ) &
+    running=$((running + 1))
+    if [ "$running" -ge "$max" ]; then wait -n || :; running=$((running - 1)); fi
+  done 9< "$list"
+  wait || :
+  for ((k = 1; k <= n; k++)); do
+    if [ -s "$d/$k.out" ]; then cat -- "$d/$k.out"; fi
+    if [ -s "$d/$k.err" ]; then cat -- "$d/$k.err" >&2; fi
+    rc=1; read -r rc < "$d/$k.rc" || :
+    if [ "$rc" != 0 ]; then rm -rf "$d"; return "$rc"; fi
+  done
+  rm -rf "$d"
+}
+
+# The paths in list "$1" whose `file -b` matches any of the globs "$3"..., in
+# list order, into file "$2".
+_filter_list() {
+  local in="$1" out="$2" f pat
+  shift 2
+  : > "$out"
+  while IFS= read -r -u 8 f; do
+    _ftype_of "$f" || continue
+    for pat in "$@"; do
+      # shellcheck disable=SC2053
+      if [[ "$REPLY" == $pat ]]; then printf '%s\n' "$f" >> "$out"; break; fi
+    done
+  done 8< "$in"
+}
+
+# Fill _rel_to_lib's memo for every directory in list "$1" before forking:
+# a worker's own writes to it are lost with the worker.
+_prewarm_rel_to_lib() {
+  local f
+  while IFS= read -r -u 8 f; do _rel_to_lib "${f%/*}"; done 8< "$1"
+}
+
 # ===========================================================================
 # Phase 1 — Copy executables and libraries from the main derivation
 # ===========================================================================
@@ -3403,12 +3451,10 @@ elif [ "$IS_DARWIN" = "1" ]; then
 
   _list_files "$out" "$bundle_work/p3"
   _classify "$bundle_work/p3"
-  while IFS= read -r -u 9 f; do
-    _ftype_of "$f" || continue
-    [[ "$REPLY" == *Mach-O* ]] || continue
-    echo "  ${f#$out/}"
-    rewrite_macho "$f"
-  done 9< "$bundle_work/p3"
+  _filter_list "$bundle_work/p3" "$bundle_work/p3.bin" '*Mach-O*'
+  _prewarm_rel_to_lib "$bundle_work/p3.bin"
+  p3_one() { echo "  ${1#$out/}"; rewrite_macho "$1"; }
+  par_map p3_one "$bundle_work/p3.bin"
 
 else
 
@@ -3454,12 +3500,8 @@ else
     esac
   }
 
-  _list_files "$out" "$bundle_work/p3"
-  _classify "$bundle_work/p3"
-  while IFS= read -r -u 9 f; do
-    _ftype_of "$f" || continue
-    filetype="$REPLY"
-    [[ "$filetype" == *ELF* ]] || continue
+  rewrite_elf() {
+    local f="$1"
     echo "  ${f#$out/}"
 
     f_dir="${f%/*}"
@@ -3540,7 +3582,13 @@ else
         fi
       fi
     fi
-  done 9< "$bundle_work/p3"
+  }
+
+  _list_files "$out" "$bundle_work/p3"
+  _classify "$bundle_work/p3"
+  _filter_list "$bundle_work/p3" "$bundle_work/p3.bin" '*ELF*'
+  _prewarm_rel_to_lib "$bundle_work/p3.bin"
+  par_map rewrite_elf "$bundle_work/p3.bin"
 
 fi
 
@@ -3551,12 +3599,12 @@ if [ "$IS_DARWIN" = "1" ]; then
   echo "Phase 4: Code signing..."
   _list_files "$out" "$bundle_work/p4"
   _classify "$bundle_work/p4"
-  while IFS= read -r -u 9 f; do
-    _ftype_of "$f" || continue
-    [[ "$REPLY" == *Mach-O* ]] || continue
-    codesign -f -s - "$f" 2>/dev/null || \
-      echo "  Warning: codesign failed for $f"
-  done 9< "$bundle_work/p4"
+  _filter_list "$bundle_work/p4" "$bundle_work/p4.bin" '*Mach-O*'
+  p4_one() {
+    codesign -f -s - "$1" 2>/dev/null || \
+      echo "  Warning: codesign failed for $1"
+  }
+  par_map p4_one "$bundle_work/p4.bin"
 fi
 
 # ===========================================================================
@@ -4344,15 +4392,16 @@ check_elf() {
 
 _list_files "$test_dir" "$bundle_work/p6"
 _classify "$bundle_work/p6"
-while IFS= read -r -u 9 f; do
-  _ftype_of "$f" || continue
-  filetype="$REPLY"
-  if [[ "$filetype" == *Mach-O* ]]; then
-    check_macho "$f"
-  elif [[ "$filetype" == *ELF* ]]; then
-    check_elf "$f"
+p6_check_one() {
+  _ftype_of "$1" || return 0
+  if [[ "$REPLY" == *Mach-O* ]]; then
+    check_macho "$1"
+  elif [[ "$REPLY" == *ELF* ]]; then
+    check_elf "$1"
   fi
-done 9< "$bundle_work/p6"
+}
+_filter_list "$bundle_work/p6" "$bundle_work/p6.bin" '*Mach-O*' '*ELF*'
+par_map p6_check_one "$bundle_work/p6.bin"
 
 # Check for /nix/ paths embedded in binary data.
 # PE is included ON WINDOWS: this check is the one part of Phase 6 that is
@@ -4369,13 +4418,14 @@ done 9< "$bundle_work/p6"
 echo "  Checking for embedded /nix/ paths..."
 # Same listing as above: checking adds only $test_dir/.errors, plain text that
 # this scan skips anyway, and leaves the order of everything else unchanged.
-while IFS= read -r -u 9 f; do
-  _ftype_of "$f" || continue
+p6_scan_one() {
+  local f="$1"
+  _ftype_of "$f" || return 0
   filetype="$REPLY"
   case "$filetype" in
     *Mach-O*|*ELF*) ;;
-    *PE32*)         [ "$IS_WINDOWS" = "1" ] || continue ;;
-    *)              continue ;;
+    *PE32*)         [ "$IS_WINDOWS" = "1" ] || return 0 ;;
+    *)              return 0 ;;
   esac
   rel="${f#$test_dir/}"
   nix_refs="$(strings "$f" 2>/dev/null | grep -c '/nix/' || true)"
@@ -4412,7 +4462,9 @@ while IFS= read -r -u 9 f; do
       done
     fi
   fi
-done 9< "$bundle_work/p6"
+}
+_filter_list "$bundle_work/p6" "$bundle_work/p6.scan" '*Mach-O*' '*ELF*' '*PE32*'
+par_map p6_scan_one "$bundle_work/p6.scan"
 
 if [ -f "$test_dir/.errors" ]; then
   error_count="$(wc -l < "$test_dir/.errors")"
