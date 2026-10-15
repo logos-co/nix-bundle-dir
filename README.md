@@ -172,6 +172,8 @@ empty `hostLibs`, or on a non-Windows target, is refused rather than ignored.
 
 - **Shebangs.** Scripts with `#!/nix/store/...` shebangs are rewritten to `#!/usr/bin/env ...`, which requires the interpreter to be on `PATH`.
 
+- **Sealed macOS bundles are carried as is.** An `.app` with `Contents/_CodeSignature` is copied byte for byte: phases 2-4 pass over it, since rewriting or re-signing any of its files would replace the identity macOS ties its permissions (the camera, for one) to. Phase 6 still checks its load commands, and fails the build if the bundle differs from the derivation's. So a sealed bundle must already link only system libraries.
+
 ## Default library excludes
 
 On Linux, a set of host-dependent libraries are excluded from bundling by default (inspired by the [AppImage excludelist](https://github.com/AppImageCommunity/pkg2appimage/blob/master/excludelist)):

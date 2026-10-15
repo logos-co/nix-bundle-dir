@@ -38,6 +38,13 @@
               mkBundle = import ./mkBundle.nix { inherit pkgs; };
             }).nested;
         }
+        // nixpkgs.lib.optionalAttrs pkgs.stdenv.isDarwin {
+          sealed-bundle =
+            (import ./tests/sealed-bundle.nix {
+              inherit pkgs;
+              mkBundle = import ./mkBundle.nix { inherit pkgs; };
+            }).carried;
+        }
         # x86_64-linux only, and the reason is cost plus evidence — NOT
         # impossibility. The two reasons this comment used to give were both
         # measured false against this flake's own nixpkgs on 2026-08-12:
