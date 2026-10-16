@@ -158,6 +158,31 @@ for dir in "${extra_dirs[@]+"${extra_dirs[@]}"}"; do
   extra_dir_roots+=("$out/$dir")
 done
 
+# A sealed macOS bundle (an .app with Contents/_CodeSignature) is carried byte for byte. Rewriting
+# or re-signing any file in it replaces the identity macOS ties its grants to, such as the camera.
+# Phases 2-4 pass over it, and Phase 6 checks that it arrived unchanged.
+sealed_bundles=()
+if [ "$IS_DARWIN" = "1" ]; then
+  while IFS= read -r app; do
+    [ -f "$app/Contents/_CodeSignature/CodeResources" ] || continue
+    rel="${app#"$out"/}"
+    # Phase 1 copied it with -L; a bundle's own symlinks are part of its seal.
+    rm -rf "$app" && mkdir -p "$app"
+    cp -RP "$DRV_PATH/$rel/." "$app/"
+    chmod -R u+w "$app"
+    sealed_bundles+=("$app")
+    echo "  Sealed bundle, carried as is: $rel"
+  done < <(find "$out" -type d -name '*.app' -prune)
+fi
+
+in_sealed_bundle() {
+  local app
+  for app in "${sealed_bundles[@]+"${sealed_bundles[@]}"}"; do
+    [[ "$1" == "$app"/* ]] && return 0
+  done
+  return 1
+}
+
 # ===========================================================================
 # Phase 1c — What TARGET is this bundle for?
 # ===========================================================================
@@ -2178,6 +2203,7 @@ fi
 for dir in "${extra_dirs[@]+"${extra_dirs[@]}"}"; do
   if [ -d "$out/$dir" ]; then
     while IFS= read -r f; do
+      in_sealed_bundle "$f" && continue
       trace_deps "$f"
     done < <(find "$out/$dir" -type f \( -name '*.dylib' -o -name '*.so' \))
   fi
@@ -3330,6 +3356,7 @@ elif [ "$IS_DARWIN" = "1" ]; then
   }
 
   find "$out" -type f | while IFS= read -r f; do
+    in_sealed_bundle "$f" && continue
     filetype="$(file -b "$f" 2>/dev/null)" || continue
     [[ "$filetype" == *Mach-O* ]] || continue
     echo "  ${f#$out/}"
@@ -3473,6 +3500,7 @@ fi
 if [ "$IS_DARWIN" = "1" ]; then
   echo "Phase 4: Code signing..."
   find "$out" -type f | while IFS= read -r f; do
+    in_sealed_bundle "$f" && continue
     filetype="$(file -b "$f" 2>/dev/null)" || continue
     [[ "$filetype" == *Mach-O* ]] || continue
     codesign -f -s - "$f" 2>/dev/null || \
@@ -4321,6 +4349,16 @@ find "$test_dir" -type f | while IFS= read -r f; do
         echo "    $ref"
       done
     fi
+  fi
+done
+
+for app in "${sealed_bundles[@]+"${sealed_bundles[@]}"}"; do
+  rel="${app#"$out"/}"
+  if diff -r --no-dereference "$DRV_PATH/$rel/." "$app/." >/dev/null 2>&1; then
+    echo "  Sealed bundle unchanged: $rel"
+  else
+    echo "  ERROR: the sealed bundle $rel differs from the derivation's; its signature no longer holds"
+    echo "1" >> "$test_dir/.errors"
   fi
 done
 
